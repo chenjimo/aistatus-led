@@ -24,7 +24,9 @@
 | `need_confirm` | 需要你确认 / 授权 | 橙色快闪（粘性） |
 | `error` | 工具失败 / 异常 | 红色急闪（粘性） |
 
-粘性状态不会被超时冲掉，必须你回应或手动解除；PC 停止心跳 15 秒后设备自动转 `offline`（极暗蓝），不会一直停在「思考中」误导人。
+`need_input` / `need_confirm` 合称「需要人处理」，**优先级最高**：一旦亮起，`coding`、`done`、工具报错等任何状态都盖不掉，只有你回复、点了确认（工具继续执行）、会话结束或 `python main.py clear` 才会解除。PC 端会在 IDE 弹确认框 / AI 停下等回复时主动推断并发出请求，详见 `docs/02` 第七节。
+
+其余粘性状态不会被超时冲掉，必须你回应或手动解除；PC 停止心跳 15 秒后设备自动转 `offline`（极暗蓝），不会一直停在「思考中」误导人。
 
 ---
 
@@ -32,7 +34,7 @@
 
 | 组件 | 版本 | 位置 |
 | --- | --- | --- |
-| **PC 端中间件** | **v1.1.0** | `main.py` + `ai_status/` |
+| **PC 端中间件** | **v1.2.0** | `main.py` + `ai_status/` |
 | **ESP32-S3 固件** | **v1.5.0（修复版）** | `esp32/firmware/ESP-S3-Demo1.ino` |
 | 通信协议 | `ai-status/1` v1.0.0（+ 可选 `src`） | `docs/04-协议与来源ID绑定.md` |
 | Python | 3.10+（实测 3.10.6） | 需加入 PATH |
@@ -66,7 +68,8 @@ aistatus-led/
 │   └── firmware/
 │       └── ESP-S3-Demo1.ino     ← v1.5.0 固件源码（WiFi 已脱敏为占位符）
 └── packages/
-    ├── aistatus-led-pc-v1.1.0.zip      ← PC 端独立发布包
+    ├── aistatus-led-pc-v1.2.0.zip      ← PC 端当前发布包
+    ├── aistatus-led-pc-v1.1.0.zip      ← PC 端历史发布包
     └── aistatus-led-esp32-v1.5.0.zip   ← 设备端独立发布包
 ```
 
@@ -107,6 +110,8 @@ python main.py clear          # 看完后解除
 
 服务窗口不要关；关掉后设备 15 秒无心跳会自动转 `offline`。
 
+> **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（67 项，不需要硬件）确认升级无误。
+
 ---
 
 ## 五、换电脑 / 换环境
@@ -144,8 +149,9 @@ python main.py clear          # 看完后解除
 
 - 串口直连实现是 **Windows 专用**（Win32 API + PowerShell 枚举串口）；Mac/Linux 需安装 `pyserial` 并小改串口枚举，纯局域网模式可设 `prefer_serial: false`。
 - 广播、mDNS、`/24` 扫描都**过不了路由器**：PC 与设备必须在同一网段；跨网段时只剩 USB 串口直连可用。
-- `outputting` 没有对应的 Hook 事件，PC 端按「一段时间无工具活动」推断，可在 `config.json` 关闭。
-- IDE 版 Hooks 只有 7 个事件；`Notification` / `PermissionRequest` 等增量事件仅 CLI 支持，需 `--with-cli` 安装。
+- `outputting` 没有对应的 Hook 事件，PC 端按「一段时间无工具活动」推断（默认 1.2s），可在 `config.json` 关闭。
+- **IDE 版确认框 / 提问框不发任何 Hooks 事件**，`tool_name` 也经常为空，所以「需要人处理」只能靠静默窗口推断：`PreToolUse` 后 4s 无 `PostToolUse` → `need_confirm`；`PostToolUse` / `Stop` 后静默 2.5s → `need_input`。阈值与开关都能在 `config.json` 调；执行很久的命令可能被误判为等待确认，工具恢复执行后会自动解除。若你的 IDE 能拿到审批字段，也可在 Hook 载荷里直接带 `ai_status_state` 精确指定。
+- `Notification` / `PermissionRequest` / `PermissionDenied` / `PostToolUseFailure` / `Elicitation` 等补强事件已默认注册：IDE 不发时无副作用，一旦发出即精确命中；CLI 用户仍可用 `--with-cli` 补齐其余事件。
 - 设备端 UDP 4210 广播发现需要 PC 防火墙放行入站规则（需管理员操作）；不改防火墙时优先用 mDNS `esp32s3-ai.local`，PC 端已支持。
 
 ---

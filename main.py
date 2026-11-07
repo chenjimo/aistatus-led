@@ -40,7 +40,13 @@ DEFAULT_CONFIG: dict = {
     "done_hold_ms": 5000,
     "idle_after_ms": 180000,
     "infer_outputting": True,
-    "outputting_after_ms": 3500,
+    "outputting_after_ms": 1200,   # 先短暂显示「输出中」，再进入等待回复
+    # 「需要人处理」推断：IDE 版 Hooks 没有确认/提问事件，靠静默窗口判断
+    "infer_need_confirm": True,
+    "need_confirm_after_ms": 4000,  # PreToolUse 后迟迟无 PostToolUse => 卡在授权
+    "infer_need_input": True,
+    "need_input_after_ms": 2500,    # PostToolUse / Stop 后静默 => 等用户回复
+    "lock_human": True,               # 等待态建立后不允许普通事件覆盖
     "prefer_serial": True,
     "serial_vid_pid": ["303A:1001", "1A86:55D3"],
     "baud": 115200,
@@ -62,6 +68,8 @@ DEFAULT_CONFIG: dict = {
     "log_file": str(APP_DIR / "ai_status.log"),
 }
 
+# IDE 版当前只发前 7 个；后 5 个属于「有则精确命中、无则忽略」的补强事件，
+# 一并注册后，IDE 升级或 CLI 混用时无需重装 Hooks 即可直接拿到确认/提问信号。
 IDE_EVENTS = [
     ("SessionStart", "startup"),
     ("UserPromptSubmit", None),
@@ -70,6 +78,11 @@ IDE_EVENTS = [
     ("Stop", None),
     ("SessionEnd", "other"),
     ("PreCompact", ""),
+    ("Notification", ""),
+    ("PermissionRequest", ""),
+    ("PermissionDenied", ""),
+    ("PostToolUseFailure", ".*"),
+    ("Elicitation", ""),
 ]
 CLI_EXTRA_EVENTS = [
     ("Notification", ""),
@@ -415,7 +428,7 @@ def cmd_selftest(args) -> int:
         checks += 1
         print(f"  PASS  {label}")
 
-    print("[1/4] Hooks 事件映射")
+    print("[1/4] Hooks 事件映射（含「需要人处理」识别）")
     cases = [
         ({"hook_event_name": "SessionStart"}, "idle"),
         ({"hook_event_name": "UserPromptSubmit", "prompt": "写代码"}, "thinking"),
@@ -426,18 +439,40 @@ def cmd_selftest(args) -> int:
         ({"hook_event_name": "PreToolUse", "tool_name": "write_to_file"}, "coding"),
         ({"hook_event_name": "PreToolUse", "tool_name": "Bash",
           "tool_input": {"requires_approval": True}}, "need_confirm"),
+        ({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"requiresApproval": True}}, "need_confirm"),
+        ({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"autoApprove": False}}, "need_confirm"),
+        ({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"permission": "ask"}}, "need_confirm"),
+        ({"hook_event_name": "PreToolUse",
+          "tool_name": "ask_followup_question"}, "need_input"),
+        ({"hook_event_name": "PreToolUse", "tool_name": "",
+          "tool_input": {"questions": [{"q": "选哪个?"}]}}, "need_input"),
         ({"hook_event_name": "PostToolUse", "tool_name": "Bash",
           "tool_response": {"success": False}}, "error"),
         ({"hook_event_name": "Notification",
           "notification_type": "permission_prompt"}, "need_confirm"),
         ({"hook_event_name": "Notification",
           "notification_type": "idle_prompt"}, "need_input"),
+        ({"hook_event_name": "PermissionRequest"}, "need_confirm"),
+        ({"hook_event_name": "Elicitation"}, "need_input"),
         ({"hook_event_name": "Stop"}, "done"),
         ({"hook_event_name": "PreToolUse", "tool_name": "Bash",
           "ai_status_state": "outputting"}, "outputting"),
     ]
     for payload, expected in cases:
         check(map_hook(payload).state == expected, f"{payload['hook_event_name']} -> {expected}")
+    check(map_hook({"hook_event_name": "PreToolUse", "tool_name": ""}).watch == "confirm",
+          "tool_name 为空也开启等待确认观察")
+    check(map_hook({"hook_event_name": "Stop"}).watch == "input",
+          "Stop 开启等待回复观察")
+    check(map_hook({"hook_event_name": "PostToolUse"}).release_sticky is True,
+          "PostToolUse 代表用户已处理完等待态")
+    check(map_hook({"hook_event_name": "PostToolUse"}).watch == "input",
+          "PostToolUse 开启等待回复观察（IDE 常不发 Stop）")
+    check(map_hook({"hook_event_name": "UserPromptSubmit"}).release_sticky is True,
+          "UserPromptSubmit 代表用户已回复")
 
     print("[2/4] 协议帧")
     frame = P.serial_frame("status", "thinking", 7, "测试", 15000, True)
@@ -447,6 +482,9 @@ def cmd_selftest(args) -> int:
     check("t" not in body and "v" not in body and body["force"] == 1, "HTTP 请求体字段")
     check(len(P.encode_line(frame).decode("utf-8").strip()) < 512, "串口单行长度")
     check(P.is_sticky("error") and not P.is_sticky("done"), "粘性状态判定")
+    check(P.HUMAN_STATES == {"need_confirm", "need_input"}
+          and P.priority("need_confirm") > P.priority("done"),
+          "等待态优先级高于全部普通状态")
     tagged = P.serial_frame("status", "thinking", 9, src="PC-A")
     check(tagged["src"] == "PC-A", "串口帧携带来源 ID")
     tagged_body = P.http_payload("thinking", 9,
@@ -454,21 +492,73 @@ def cmd_selftest(args) -> int:
     check(tagged_body["src"] == "PC-A"
           and tagged_body["msg"].startswith("[PC-A]"), "HTTP 帧与 msg 携带来源 ID")
 
-    print("[3/4] 状态机仲裁")
-    machine = StateMachine(min_dwell_ms=0, infer_outputting=False)
+    print("[3/4] 「需要人处理」推断、锁定与解除")
+
+    def new_machine(**kw) -> StateMachine:
+        base = {"min_dwell_ms": 0, "infer_outputting": False,
+                "need_confirm_after_ms": 0, "need_input_after_ms": 0}
+        base.update(kw)
+        return StateMachine(**base)
+
+    machine = new_machine()
     machine.update(map_hook({"hook_event_name": "Notification",
                              "notification_type": "permission_prompt", "session_id": "s1"}))
     check(machine.current == "need_confirm", "授权请求转 need_confirm")
-    machine.update(map_hook({"hook_event_name": "Stop", "session_id": "s1"}))
-    check(machine.current == "need_confirm", "粘性状态不被 done 冲掉")
+    for payload, label in [
+        ({"hook_event_name": "Stop", "session_id": "s1"}, "done"),
+        ({"hook_event_name": "PreToolUse", "tool_name": "write_to_file",
+          "session_id": "s1"}, "coding"),
+        ({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+          "tool_response": {"success": False}, "session_id": "s1"}, "工具报错"),
+        ({"hook_event_name": "StopFailure", "session_id": "s1"}, "任务失败"),
+    ]:
+        machine.update(map_hook(payload))
+        check(machine.current == "need_confirm", f"{label} 不能覆盖等待态")
+    check(machine.snapshot()["waiting_for_human"] is True, "等待态被标记")
+
     tr = machine.update(map_hook({"hook_event_name": "UserPromptSubmit",
                                   "session_id": "s1", "prompt": "继续"}))
     check(machine.current == "thinking" and bool(tr) and tr[0].force,
           "用户回复解除粘性并 force 覆盖设备优先级")
-    done_machine = StateMachine(min_dwell_ms=0, done_hold_ms=0, infer_outputting=False)
+
+    infer = new_machine()
+    infer.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "",
+                           "session_id": "s2"}))
+    tr = infer.tick(time.monotonic() + 0.01)
+    check(any(t.state == "need_confirm" and t.force for t in tr),
+          "PreToolUse 静默 -> need_confirm 且 force")
+    check(infer.current == "need_confirm", "推断命中后灯停在等待确认")
+    infer.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s2"}))
+    check(infer.sticky is None and infer.current == "thinking",
+          "PostToolUse 代表已处理，等待态立即解除")
+
+    fast = new_machine(need_confirm_after_ms=5000, need_input_after_ms=5000)
+    fast.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                          "session_id": "s3"}))
+    fast.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s3"}))
+    check(not fast.tick(time.monotonic() + 0.01), "工具正常完成不误报等待确认")
+
+    post_m = new_machine()
+    post_m.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s5"}))
+    post_m.tick(time.monotonic() + 0.01)
+    check(post_m.current == "need_input",
+          "IDE 不发 Stop 时，PostToolUse 静默同样触发 need_input")
+
+    stop_m = new_machine()
+    stop_m.update(map_hook({"hook_event_name": "Stop", "session_id": "s4"}))
+    stop_m.tick(time.monotonic() + 0.01)
+    check(stop_m.current == "need_input", "Stop 静默 -> need_input")
+    stop_m.update(map_hook({"hook_event_name": "PermissionRequest", "session_id": "s4"}))
+    check(stop_m.sticky[0] == "need_confirm", "等待回复可升级为等待确认")
+    stop_m.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                            "session_id": "s4"}))
+    check(stop_m.sticky[0] == "need_confirm", "升级后仍不被普通事件覆盖")
+    check(any(t.state == "idle" for t in stop_m.clear_sticky()), "clear 强制解除等待态")
+
+    done_machine = new_machine(done_hold_ms=0, infer_need_input=False)
     done_machine.update(map_hook({"hook_event_name": "Stop"}))
     check(any(t.state == "idle" for t in done_machine.tick(time.monotonic() + 0.1)),
-          "done 超时自动回 idle")
+          "关闭推断后 done 超时自动回 idle")
 
     print("[4/4] 事件总线端到端（模拟设备）")
     sock = socket.socket()
@@ -477,7 +567,8 @@ def cmd_selftest(args) -> int:
     sock.close()
     cfg = dict(DEFAULT_CONFIG)
     cfg.update({"simulate": True, "listen_port": port, "log_file": "",
-                "infer_outputting": False, "source_id": "SELFTEST-PC"})
+                "infer_outputting": False, "source_id": "SELFTEST-PC",
+                "need_confirm_after_ms": 1000, "need_input_after_ms": 700})
     quiet = logging.getLogger("ai_status_selftest")
     quiet.setLevel(logging.CRITICAL)
     quiet.addHandler(logging.NullHandler())
@@ -527,6 +618,39 @@ def cmd_selftest(args) -> int:
               "Hook 客户端返回合法 HookOutput")
         check(_get(base + "/health")["state"]["sticky"] == "need_confirm",
               "Hooks 子进程经 stdin/HTTP 驱动状态机")
+        _post(base + "/clear", {})
+
+        # IDE 版没有确认事件：PreToolUse 之后静默，必须真的向设备打出 need_confirm
+        _post(base + "/event", {"hook_event_name": "PreToolUse",
+                                "session_id": "wait", "tool_name": ""})
+        time.sleep(1.4)
+        health = _get(base + "/health")
+        check(health["state"]["state"] == "need_confirm"
+              and health["state"]["waiting_for_human"] is True,
+              "端到端：静默后真的打出 need_confirm")
+        check(health["device"]["last_frame"].get("state") == "need_confirm",
+              "设备最后一帧为 need_confirm")
+        _post(base + "/state", {"state": "error", "msg": "不能被覆盖"})
+        check(_get(base + "/health")["state"]["state"] == "need_confirm",
+              "端到端：普通状态覆盖不了等待态")
+        _post(base + "/event", {"hook_event_name": "PostToolUse", "session_id": "wait"})
+        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
+              "端到端：工具继续后等待态解除")
+        time.sleep(0.9)
+        check(_get(base + "/health")["state"]["state"] == "need_input",
+              "端到端：PostToolUse 静默打出 need_input（不依赖 Stop）")
+        _post(base + "/event", {"hook_event_name": "UserPromptSubmit",
+                                "session_id": "wait", "prompt": "继续"})
+        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
+              "端到端：用户回复解除等待态")
+        _post(base + "/event", {"hook_event_name": "Stop", "session_id": "wait"})
+        time.sleep(1.0)
+        check(_get(base + "/health")["state"]["state"] == "need_input",
+              "端到端：Stop 后打出 need_input")
+        _post(base + "/event", {"hook_event_name": "UserPromptSubmit",
+                                "session_id": "wait", "prompt": "收到"})
+        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
+              "端到端：用户回复后等待态解除")
         _post(base + "/clear", {})
     finally:
         svc.stop()

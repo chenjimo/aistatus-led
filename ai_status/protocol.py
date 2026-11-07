@@ -30,6 +30,10 @@ STATE_META: dict[str, tuple[int, bool, int]] = {
 STICKY_STATES = frozenset(s for s, meta in STATE_META.items() if meta[1])
 VALID_STATES = frozenset(STATE_META)
 
+# 需要人工介入的状态：一旦建立就锁定，普通事件（含 error）不得覆盖，
+# 只有用户真正处理完（回复/授权/拒绝/会话结束/clear）才允许解除。
+HUMAN_STATES = frozenset({"need_confirm", "need_input"})
+
 
 def is_valid(state: str) -> bool:
     return state in VALID_STATES

@@ -270,7 +270,8 @@ class DeviceLink:
             self._resync_seq()
         else:
             self.last_error = ("未检测到 ESP32-S3；本机也未实现 ai-status/1。"
-                               "可连接 AP：ESP32S3-Fallback / 12345678 / 192.168.4.1")
+                               "可连接设备 AP（SSID: ESP32S3-Fallback，密码见固件 "
+                               "AP_PASSWORD 配置），再用 192.168.4.1 访问面板")
             self.log.warning(self.last_error)
         return self.connected
 
