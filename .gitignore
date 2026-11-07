@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 本机运行时生成物（不要提交，也不要跨电脑复制）
+config.json
+client_id.json
+last_ip.json
+ai_status.log
+*.log
+
+# 含本机绝对路径的生成物（由 install-hooks 自动重建）
+hooks.settings.*.json
+
+# 打包/临时目录
+_portable_*/
+_temp/
+*.bak
+settings.json.bak-*
+
+# 系统
+Thumbs.db
+.DS_Store

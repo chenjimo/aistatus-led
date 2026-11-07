@@ -1,0 +1,3 @@
+# 核心功能零依赖：Python 3.9+ 标准库即可运行（Windows 串口通过 ctypes 直连 Win32 API）。
+# 以下为可选增强：安装后自动优先使用 pyserial 做串口枚举与读写；不装也能正常工作。
+pyserial>=3.5,<4 ; sys_platform == "win32"
