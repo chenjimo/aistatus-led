@@ -37,16 +37,13 @@ DEFAULT_CONFIG: dict = {
     "listen_port": 8765,
     "heartbeat_ms": 5000,
     "min_dwell_ms": 300,
-    "done_hold_ms": 5000,
-    "idle_after_ms": 180000,
-    "infer_outputting": True,
-    "outputting_after_ms": 1200,   # 先短暂显示「输出中」，再进入等待回复
-    # 「需要人处理」推断：IDE 版 Hooks 没有确认/提问事件，靠静默窗口判断
-    "infer_need_confirm": True,
-    "need_confirm_after_ms": 4000,  # PreToolUse 后迟迟无 PostToolUse => 卡在授权
-    "infer_need_input": True,
-    "need_input_after_ms": 2500,    # PostToolUse / Stop 后静默 => 等用户回复
-    "lock_human": True,               # 等待态建立后不允许普通事件覆盖
+    "done_hold_ms": 10000,          # 完成绿色常亮 10s 后回 idle
+    "idle_after_ms": 600000,        # 非工作态长时间无事件回 idle
+    "stalled_after_ms": 180000,     # 工作中卡住 3 分钟 -> error 红色快闪；0 = 关闭
+    "error_hold_ms": 3000,          # 红闪至少显示 3s，之后可由工作事件自动恢复
+    "infer_outputting": False,      # 无「流式输出」事件，默认不靠静默猜测
+    "outputting_after_ms": 3500,
+    "lock_human": True,             # 等待态建立后不允许普通事件覆盖
     "prefer_serial": True,
     "serial_vid_pid": ["303A:1001", "1A86:55D3"],
     "baud": 115200,
@@ -428,7 +425,7 @@ def cmd_selftest(args) -> int:
         checks += 1
         print(f"  PASS  {label}")
 
-    print("[1/4] Hooks 事件映射（含「需要人处理」识别）")
+    print("[1/4] Hooks 事件映射（零猜测：只认真实事件与明确字段）")
     cases = [
         ({"hook_event_name": "SessionStart"}, "idle"),
         ({"hook_event_name": "UserPromptSubmit", "prompt": "写代码"}, "thinking"),
@@ -449,6 +446,7 @@ def cmd_selftest(args) -> int:
           "tool_name": "ask_followup_question"}, "need_input"),
         ({"hook_event_name": "PreToolUse", "tool_name": "",
           "tool_input": {"questions": [{"q": "选哪个?"}]}}, "need_input"),
+        ({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, "thinking"),
         ({"hook_event_name": "PostToolUse", "tool_name": "Bash",
           "tool_response": {"success": False}}, "error"),
         ({"hook_event_name": "Notification",
@@ -463,14 +461,14 @@ def cmd_selftest(args) -> int:
     ]
     for payload, expected in cases:
         check(map_hook(payload).state == expected, f"{payload['hook_event_name']} -> {expected}")
-    check(map_hook({"hook_event_name": "PreToolUse", "tool_name": ""}).watch == "confirm",
-          "tool_name 为空也开启等待确认观察")
-    check(map_hook({"hook_event_name": "Stop"}).watch == "input",
-          "Stop 开启等待回复观察")
+    check(map_hook({"hook_event_name": "PreToolUse", "tool_name": ""}).state == "thinking",
+          "tool_name 为空归为思考，不猜成需要人处理")
+    check(map_hook({"hook_event_name": "PostToolUse"}).state == "thinking",
+          "工具完成回到思考（紫色呼吸）")
     check(map_hook({"hook_event_name": "PostToolUse"}).release_sticky is True,
-          "PostToolUse 代表用户已处理完等待态")
-    check(map_hook({"hook_event_name": "PostToolUse"}).watch == "input",
-          "PostToolUse 开启等待回复观察（IDE 常不发 Stop）")
+          "PostToolUse 是等待态的解除信号")
+    check(map_hook({"hook_event_name": "Stop"}).state == "done",
+          "Stop 只上报完成，不猜测等人")
     check(map_hook({"hook_event_name": "UserPromptSubmit"}).release_sticky is True,
           "UserPromptSubmit 代表用户已回复")
 
@@ -485,6 +483,7 @@ def cmd_selftest(args) -> int:
     check(P.HUMAN_STATES == {"need_confirm", "need_input"}
           and P.priority("need_confirm") > P.priority("done"),
           "等待态优先级高于全部普通状态")
+    check(P.default_ttl("done") == 10000, "完成态 TTL 10 秒随帧下发给固件")
     tagged = P.serial_frame("status", "thinking", 9, src="PC-A")
     check(tagged["src"] == "PC-A", "串口帧携带来源 ID")
     tagged_body = P.http_payload("thinking", 9,
@@ -492,14 +491,14 @@ def cmd_selftest(args) -> int:
     check(tagged_body["src"] == "PC-A"
           and tagged_body["msg"].startswith("[PC-A]"), "HTTP 帧与 msg 携带来源 ID")
 
-    print("[3/4] 「需要人处理」推断、锁定与解除")
+    print("[3/4] 状态机：零误报、完成 10s、卡住归红色错误")
 
     def new_machine(**kw) -> StateMachine:
-        base = {"min_dwell_ms": 0, "infer_outputting": False,
-                "need_confirm_after_ms": 0, "need_input_after_ms": 0}
+        base = {"min_dwell_ms": 0, "infer_outputting": False}
         base.update(kw)
         return StateMachine(**base)
 
+    # 1) 明确的授权请求 -> need_confirm，且不可被普通状态覆盖
     machine = new_machine()
     machine.update(map_hook({"hook_event_name": "Notification",
                              "notification_type": "permission_prompt", "session_id": "s1"}))
@@ -521,44 +520,63 @@ def cmd_selftest(args) -> int:
     check(machine.current == "thinking" and bool(tr) and tr[0].force,
           "用户回复解除粘性并 force 覆盖设备优先级")
 
-    infer = new_machine()
-    infer.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "",
-                           "session_id": "s2"}))
-    tr = infer.tick(time.monotonic() + 0.01)
-    check(any(t.state == "need_confirm" and t.force for t in tr),
-          "PreToolUse 静默 -> need_confirm 且 force")
-    check(infer.current == "need_confirm", "推断命中后灯停在等待确认")
-    infer.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s2"}))
-    check(infer.sticky is None and infer.current == "thinking",
-          "PostToolUse 代表已处理，等待态立即解除")
+    # 2) 核心回归：深度思考 / 长时间静默绝不误报「需要人处理」
+    quiet_m = new_machine(stalled_after_ms=0, idle_after_ms=10 ** 9)
+    quiet_m.update(map_hook({"hook_event_name": "UserPromptSubmit",
+                             "session_id": "s2", "prompt": "请深度分析"}))
+    for sec in (1, 10, 60, 300):
+        quiet_m.tick(time.monotonic() + sec)
+        check(quiet_m.current == "thinking"
+              and quiet_m.sticky is None
+              and quiet_m.snapshot()["waiting_for_human"] is False,
+              f"静默 {sec}s 仍是 thinking，不误报 need_input/need_confirm")
 
-    fast = new_machine(need_confirm_after_ms=5000, need_input_after_ms=5000)
-    fast.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                          "session_id": "s3"}))
-    fast.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s3"}))
-    check(not fast.tick(time.monotonic() + 0.01), "工具正常完成不误报等待确认")
+    # 3) IDE 实测 PreToolUse 远多于 PostToolUse：缺完成事件也不能误判
+    mismatch = new_machine(stalled_after_ms=0, idle_after_ms=10 ** 9)
+    mismatch.update(map_hook({"hook_event_name": "PreToolUse",
+                              "tool_name": "Grep", "session_id": "s3"}))
+    check(mismatch.current == "searching", "检索工具 -> searching 黄色闪")
+    mismatch.tick(time.monotonic() + 120)
+    check(mismatch.current == "searching" and mismatch.sticky is None,
+          "PreToolUse 后 120s 无 PostToolUse 也不误报确认")
 
-    post_m = new_machine()
-    post_m.update(map_hook({"hook_event_name": "PostToolUse", "session_id": "s5"}))
-    post_m.tick(time.monotonic() + 0.01)
-    check(post_m.current == "need_input",
-          "IDE 不发 Stop 时，PostToolUse 静默同样触发 need_input")
+    # 4) 完成 10s -> idle（force 压过设备端 done(40)->idle(10) 降级检查）
+    done_m = new_machine(done_hold_ms=10000, stalled_after_ms=0)
+    done_m.update(map_hook({"hook_event_name": "Stop"}))
+    check(done_m.current == "done", "Stop -> done 绿色完成态")
+    check(not done_m.tick(time.monotonic() + 9), "done 9s 内保持不变")
+    tr = done_m.tick(time.monotonic() + 11)
+    check(any(t.state == "idle" and t.force for t in tr),
+          "done 10s 到期 force 回 idle")
 
-    stop_m = new_machine()
-    stop_m.update(map_hook({"hook_event_name": "Stop", "session_id": "s4"}))
-    stop_m.tick(time.monotonic() + 0.01)
-    check(stop_m.current == "need_input", "Stop 静默 -> need_input")
-    stop_m.update(map_hook({"hook_event_name": "PermissionRequest", "session_id": "s4"}))
-    check(stop_m.sticky[0] == "need_confirm", "等待回复可升级为等待确认")
-    stop_m.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                            "session_id": "s4"}))
-    check(stop_m.sticky[0] == "need_confirm", "升级后仍不被普通事件覆盖")
-    check(any(t.state == "idle" for t in stop_m.clear_sticky()), "clear 强制解除等待态")
+    # 5) 唯一保留的超时：卡住 3 分钟 -> error 红闪，而不是「等人」
+    stalled = new_machine(stalled_after_ms=180000, idle_after_ms=10 ** 9)
+    stalled.update(map_hook({"hook_event_name": "UserPromptSubmit", "prompt": "长任务"}))
+    check(not stalled.tick(time.monotonic() + 179), "卡住 179s 不报警")
+    tr = stalled.tick(time.monotonic() + 181)
+    check(any(t.state == "error" and t.force for t in tr),
+          "卡住 3 分钟 -> error 红色快闪")
+    check(stalled.sticky[0] == "error"
+          and stalled.snapshot()["waiting_for_human"] is False,
+          "处理时间过长属于异常，不冒充需要人确认/回复")
+    stalled.update(map_hook({"hook_event_name": "UserPromptSubmit", "prompt": "重试"}))
+    check(stalled.sticky is None and stalled.current == "thinking",
+          "用户新需求立即解除卡住红闪")
 
-    done_machine = new_machine(done_hold_ms=0, infer_need_input=False)
-    done_machine.update(map_hook({"hook_event_name": "Stop"}))
-    check(any(t.state == "idle" for t in done_machine.tick(time.monotonic() + 0.1)),
-          "关闭推断后 done 超时自动回 idle")
+    # 6) 需要人处理的三种快闪都只由明确信号触发
+    for payload, expected in [
+        ({"hook_event_name": "PermissionRequest"}, "need_confirm"),
+        ({"hook_event_name": "Elicitation"}, "need_input"),
+        ({"hook_event_name": "PostToolUseFailure"}, "error"),
+    ]:
+        one = new_machine()
+        one.update(map_hook(payload))
+        check(one.current == expected, f"{payload['hook_event_name']} -> {expected}")
+
+    # 7) clear 强制解除
+    locked = new_machine()
+    locked.update(map_hook({"hook_event_name": "PermissionRequest"}))
+    check(any(t.state == "idle" for t in locked.clear_sticky()), "clear 强制解除等待态")
 
     print("[4/4] 事件总线端到端（模拟设备）")
     sock = socket.socket()
@@ -568,7 +586,7 @@ def cmd_selftest(args) -> int:
     cfg = dict(DEFAULT_CONFIG)
     cfg.update({"simulate": True, "listen_port": port, "log_file": "",
                 "infer_outputting": False, "source_id": "SELFTEST-PC",
-                "need_confirm_after_ms": 1000, "need_input_after_ms": 700})
+                "stalled_after_ms": 0, "done_hold_ms": 400})
     quiet = logging.getLogger("ai_status_selftest")
     quiet.setLevel(logging.CRITICAL)
     quiet.addHandler(logging.NullHandler())
@@ -620,37 +638,29 @@ def cmd_selftest(args) -> int:
               "Hooks 子进程经 stdin/HTTP 驱动状态机")
         _post(base + "/clear", {})
 
-        # IDE 版没有确认事件：PreToolUse 之后静默，必须真的向设备打出 need_confirm
+        # 零猜测回归：PreToolUse 后长时间静默，绝不能误报「需要人处理」
         _post(base + "/event", {"hook_event_name": "PreToolUse",
-                                "session_id": "wait", "tool_name": ""})
-        time.sleep(1.4)
+                                "session_id": "wait", "tool_name": "Grep"})
+        time.sleep(1.2)
         health = _get(base + "/health")
-        check(health["state"]["state"] == "need_confirm"
-              and health["state"]["waiting_for_human"] is True,
-              "端到端：静默后真的打出 need_confirm")
-        check(health["device"]["last_frame"].get("state") == "need_confirm",
-              "设备最后一帧为 need_confirm")
-        _post(base + "/state", {"state": "error", "msg": "不能被覆盖"})
-        check(_get(base + "/health")["state"]["state"] == "need_confirm",
-              "端到端：普通状态覆盖不了等待态")
+        check(health["state"]["state"] == "searching"
+              and health["state"]["waiting_for_human"] is False,
+              "端到端：长时间静默不误报 need_input/need_confirm")
+        check(health["device"]["last_frame"].get("state") == "searching",
+              "设备最后一帧仍是找资料，未被等待态抢占")
         _post(base + "/event", {"hook_event_name": "PostToolUse", "session_id": "wait"})
-        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
-              "端到端：工具继续后等待态解除")
-        time.sleep(0.9)
-        check(_get(base + "/health")["state"]["state"] == "need_input",
-              "端到端：PostToolUse 静默打出 need_input（不依赖 Stop）")
-        _post(base + "/event", {"hook_event_name": "UserPromptSubmit",
-                                "session_id": "wait", "prompt": "继续"})
-        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
-              "端到端：用户回复解除等待态")
+        check(_get(base + "/health")["state"]["state"] == "thinking",
+              "端到端：工具完成回到思考（紫色呼吸）")
+
+        # 完成态：Stop -> done（TTL 10s）-> 到期 force 回 idle
         _post(base + "/event", {"hook_event_name": "Stop", "session_id": "wait"})
-        time.sleep(1.0)
-        check(_get(base + "/health")["state"]["state"] == "need_input",
-              "端到端：Stop 后打出 need_input")
-        _post(base + "/event", {"hook_event_name": "UserPromptSubmit",
-                                "session_id": "wait", "prompt": "收到"})
-        check(_get(base + "/health")["state"]["waiting_for_human"] is False,
-              "端到端：用户回复后等待态解除")
+        health = _get(base + "/health")
+        check(health["state"]["state"] == "done", "端到端：Stop -> 完成（绿色）")
+        check(health["device"]["last_frame"].get("ttl") == 10000,
+              "完成帧携带 10 秒 TTL，固件侧同步生效")
+        time.sleep(0.7)
+        check(_get(base + "/health")["state"]["state"] == "idle",
+              "端到端：完成到期回到空闲（暗色深蓝）")
         _post(base + "/clear", {})
     finally:
         svc.stop()

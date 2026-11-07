@@ -1,7 +1,11 @@
 """CodeBuddy Hooks 事件 -> ai-status/1 状态映射。
 
+v1.3.0 原则：**只按真实事件 / 明确字段上报，绝不用「静默」猜用户要不要操作**。
+实测 IDE 版 PreToolUse 数量远大于 PostToolUse（工具完成事件经常根本不发），
+任何「X 秒内没等到某个事件就判定需要人处理」的推断，都会把深度思考误报成
+need_input / need_confirm，因此 v1.2.0 的静默推断已整体移除。
+
 IDE（Craft Agent）与 CLI 的工具名不同，这里同时兼容两套别名。
-参考：CodeBuddy IDE Hooks User Guide 附录 E、CLI Hooks Reference 事件矩阵。
 """
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ from dataclasses import dataclass
 
 from .protocol import is_valid
 
-# 找资料 / 检索 / 读文档
+# 找资料 / 检索 / 读文档 -> searching（黄色慢闪）
 SEARCH_TOOLS = frozenset({
     "web_search", "WebSearch", "web_fetch", "WebFetch", "RAG_search",
     "search_content", "Grep", "search_file", "list_dir", "Glob",
@@ -17,37 +21,35 @@ SEARCH_TOOLS = frozenset({
     "mcp__*",  # 由前缀匹配单独处理
 })
 
-# 写脚本 / 改文件 / 执行命令
+# 写脚本 / 改文件 / 执行命令 -> coding（浅蓝青呼吸）
 CODE_TOOLS = frozenset({
     "write_to_file", "Write", "replace_in_file", "Edit", "MultiEdit",
     "NotebookWrite", "delete_file", "execute_command", "Bash",
     "apply_patch", "create_file", "install_binary",
 })
 
-# 主动向用户提问（IDE / CLI / 常见别名）
+# 主动向用户提问 -> need_input（粉白双闪）
 INPUT_TOOLS = frozenset({
     "ask_followup_question", "AskUserQuestion", "AskUser", "ask_user",
     "askUser", "prompt_user", "Elicitation",
 })
 
-# 等待拍板 / 授权
+# 等待拍板 / 授权 -> need_confirm（橙色快闪）
 CONFIRM_EVENTS = frozenset({
     "PermissionRequest", "PermissionPrompt", "ToolPermissionRequest",
 })
-# 异常 / 失败
+# 异常 / 失败 -> error（红色快闪）
 FAILURE_EVENTS = frozenset({"PostToolUseFailure", "PermissionDenied", "StopFailure", "TaskFailed"})
-# 需要用户补充信息
+# 需要用户补充信息 -> need_input
 INPUT_EVENTS = frozenset({"Elicitation", "ElicitationDialog", "AskUser"})
 
-# Hook 载荷里表示「需要审批」的字段别名。IDE 版字段不稳定（且 tool_name 常为空），
-# 所以对 payload / tool_input / 常见嵌套层做宽匹配，只认键名不猜正文内容。
+# Hook 载荷里表示「需要审批」的字段别名。只认键名，不猜正文内容。
 APPROVAL_KEYS = frozenset({
     "requires_approval", "requiresapproval", "need_approval", "needapproval",
     "approval_required", "approvalrequired", "requires_confirmation",
     "requiresconfirmation", "confirm", "confirmation", "permission",
     "permission_decision", "permissiondecision", "is_dangerous", "dangerous",
 })
-# 这些字段取反：值显式为 False 才表示需要人工确认
 AUTO_APPROVE_KEYS = frozenset({
     "auto_approve", "autoapprove", "autoapproved", "skip_approval",
     "skipapproval", "autoaccept",
@@ -77,9 +79,6 @@ class StatusEvent:
     msg: str = ""
     force: bool = False        # 需要突破设备端优先级检查时置 1
     release_sticky: bool = False
-    # 本事件之后若持续静默，就推断为「等待人工处理」：
-    # "confirm" -> need_confirm（工具卡在授权），"input" -> need_input（本轮结束等回复）
-    watch: str = ""
 
 
 def _short(value, limit: int = 60) -> str:
@@ -158,23 +157,19 @@ def _input_hint(payload: dict, tool_input: dict, tool_name: str) -> bool:
     return False
 
 
-def _tool_state(tool_name: str, tool_input: dict, payload: dict) -> tuple[str, str, str]:
-    """返回 (state, msg, watch)。
-
-    IDE 版 Hooks 不发送 PermissionRequest / Notification，且 tool_name 经常为空，
-    因此除了显式审批字段，还要给每个 PreToolUse 挂一个「静默观察」：
-    若 need_confirm_after_ms 内没有 PostToolUse，就判定工具卡在授权弹窗。
-    """
+def _tool_state(tool_name: str, tool_input: dict, payload: dict) -> tuple[str, str]:
+    """返回 (state, msg)。只按工具名与明确的审批/提问字段分类，不做静默推断。"""
     name = tool_name or ""
     if _input_hint(payload, tool_input, name):
-        return "need_input", f"等待用户回复：{name or '提问'}", ""
+        return "need_input", f"等待用户回复：{name or '提问'}"
     if _approval_hint(payload, tool_input):
-        return "need_confirm", f"等待用户确认：{name or '授权'}", ""
+        return "need_confirm", f"等待用户确认：{name or '授权'}"
     if name in CODE_TOOLS:
-        return "coding", f"执行工具：{name}", "confirm"
+        return "coding", f"执行工具：{name}"
     if name in SEARCH_TOOLS or name.startswith("mcp__") or name.startswith("mcp."):
-        return "searching", f"检索资料：{name}", "confirm"
-    return "thinking", f"调用工具：{name}", "confirm"
+        return "searching", f"检索资料：{name}"
+    # IDE 版 tool_name 经常为空：宁可显示「思考」，也不猜成「需要人处理」
+    return "thinking", f"调用工具：{name}"
 
 
 def map_hook(payload: dict, event_hint: str = "") -> StatusEvent:
@@ -195,26 +190,23 @@ def map_hook(payload: dict, event_hint: str = "") -> StatusEvent:
                            _short(payload.get("msg")), bool(payload.get("force")),
                            bool(payload.get("release_sticky")))
 
-    if event == "SessionStart":
-        return StatusEvent("idle", "会话开始", session, force=True, release_sticky=True)
-    if event == "SessionEnd":
-        return StatusEvent("idle", "会话结束", session, force=True, release_sticky=True)
+    if event in ("SessionStart", "SessionEnd"):
+        return StatusEvent("idle", "会话开始" if event == "SessionStart" else "会话结束",
+                           session, force=True, release_sticky=True)
     if event == "UserPromptSubmit":
         return StatusEvent("thinking", "收到新需求：" + _short(payload.get("prompt")),
                            session, force=True, release_sticky=True)
 
     if event in ("PreToolUse", "PostToolUse"):
         if event == "PostToolUse" and _response_failed(payload.get("tool_response")):
-            # 工具报错不等于「用户处理完等待态」：仍受锁定保护，不能盖掉等待灯
             return StatusEvent("error", f"工具执行失败：{tool}", session)
         if event == "PostToolUse":
-            # 双重含义：① 工具真的继续执行/结束了，之前卡住的授权已处理掉；
-            # ② 之后若持续静默，说明 AI 本轮收尾、正在等用户回复（IDE 版往往
-            #    根本不发 Stop，所以这个观察点比 Stop 更可靠）。
-            return StatusEvent(None, f"工具完成：{tool}", session,
-                               release_sticky=True, watch="input")
-        state, msg, watch = _tool_state(tool, tool_input, payload)
-        return StatusEvent(state, msg, session, watch=watch)
+            # 工具真的跑完了：回到「思考」紫色呼吸，同时说明此前若卡在确认已被处理掉。
+            # 这一条也是 need_confirm / need_input / error 的主要解除信号。
+            return StatusEvent("thinking", "工具完成，继续处理：" + tool, session,
+                               release_sticky=True)
+        state, msg = _tool_state(tool, tool_input, payload)
+        return StatusEvent(state, msg, session)
 
     if event == "Notification":
         kind = str(payload.get("notification_type") or "")
@@ -234,9 +226,10 @@ def map_hook(payload: dict, event_hint: str = "") -> StatusEvent:
         return StatusEvent("need_input", "等待用户补充信息", session)
 
     if event == "Stop":
-        # 本轮结束 => 之后只可能在等用户下一条消息。先保持 done 灯效，
-        # 由状态机在 need_input_after_ms 后升级为 need_input（粘性、不可覆盖）。
-        return StatusEvent("done", "本轮任务完成", session, watch="input")
+        # 本轮完成 -> 绿色常亮 10s（TTL 由 PC 帧下发），到期回 idle。
+        # 不解除等待态：用户上一轮明确要求「不处理掉就不能被覆盖」。
+        # 也不再由「静默」升级成 need_input。
+        return StatusEvent("done", "本轮任务完成", session)
 
     if event in NOOP_EVENTS:
         return StatusEvent(None, f"事件：{event}", session)

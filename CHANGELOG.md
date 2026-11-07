@@ -4,7 +4,26 @@
 
 ## PC 端中间件
 
-### v1.2.0（2026-11-08，当前发布版）
+### v1.3.0（2026-11-08，当前发布版）
+
+**回退 v1.2.0 的静默推断，改为零猜测的状态分类**。v1.2.0 把「深度思考时长时间无事件」误判成 `need_input` / `need_confirm`，实际使用比 v1.1.0 更糟。
+
+- 实测证据：某次 39 条事件中 `PreToolUse` 29 / `PostToolUse` 9（完成事件大量缺失）；另一批 50 条事件里静默窗口 5~60 秒共 20+ 个。v1.2.0 在这 50 条上打出 23 帧等待态，几乎全是误报；v1.3.0 为 **0 帧**。
+- 移除 `watch` 观察窗口与 `_enter_human`；`infer_need_confirm` / `need_confirm_after_ms` / `infer_need_input` / `need_input_after_ms` 全部废弃（旧 `config.json` 里残留无害，会被忽略）。
+- 状态只由真实事件驱动，按「空闲 / 工作中 / 完成 / 需要我处理」分清：
+  - `UserPromptSubmit`、工具名为空、`PostToolUse` 成功 → `thinking`（紫色呼吸）；**深度思考不再变等待态**。
+  - 检索 / 读文件类 → `searching`（黄色慢闪）；写文件 / 执行命令类 → `coding`（浅蓝青呼吸）。
+  - `Stop` → `done`，**10 秒**后 `force` 回 `idle`；`done_hold_ms=10000`、帧 `ttl=10000` 覆盖固件默认 5000ms，协议与固件都不用改。
+  - `outputting`（渐变流动）默认不再由静默推断，只认显式 `ai_status_state`；`infer_outputting` 默认 `false`。
+  - `need_confirm` / `need_input` / `error` 三类快闪只由明确的审批字段、提问工具、补强 Hooks 事件、工具失败事件触发；仍保持最高优先级锁定与受控解除。
+- 新增「处理时间过长」归为红色 `error`：工作态连续 `stalled_after_ms`（默认 180000ms = 3 分钟）无任何事件才触发，深度思考不会误报；`error_hold_ms`（3s）保证红闪看得见，之后 AI 恢复工作自动清除；设 `0` 可关闭。
+- `idle_after_ms` 默认 600000；`/health` 用 `quiet_ms` / `stalled_after_ms` 取代 `watch`；`/events` 去掉 `watch` 字段。
+- 自检扩充到 74 项，新增「静默 1/10/60/300 秒不误报」「缺 `PostToolUse` 不误判」「完成 10s 带 force/ttl」「卡住 3 分钟归 `error`」等回归用例。
+- 协议 `ai-status/1` 状态枚举与字段**未改动**，固件无需升级；升级 PC 端后需重启 `start.bat`。
+
+### v1.2.0（2026-11-08，已由 v1.3.0 取代，不建议使用）
+
+> 本版的静默推断会把深度思考误报成等待态，请直接升级到 v1.3.0。以下内容仅作变更记录。
 
 修复「需要人处理」状态从未被上报的问题。此前 IDE 版 Hooks 不发 `PermissionRequest` / `Notification` / `Elicitation`，`tool_name` 又常为空，导致 `need_confirm` / `need_input` 映射分支永远命中不到，PC 端一帧都没发给设备。
 

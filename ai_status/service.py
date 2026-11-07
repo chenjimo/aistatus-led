@@ -24,14 +24,12 @@ class StatusService:
         self.log = log or logging.getLogger("ai_status")
         self.machine = StateMachine(
             min_dwell_ms=int(cfg.get("min_dwell_ms", 300)),
-            done_hold_ms=int(cfg.get("done_hold_ms", 5000)),
-            idle_after_ms=int(cfg.get("idle_after_ms", 180000)),
-            infer_outputting=bool(cfg.get("infer_outputting", True)),
+            done_hold_ms=int(cfg.get("done_hold_ms", 10000)),
+            idle_after_ms=int(cfg.get("idle_after_ms", 600000)),
+            stalled_after_ms=int(cfg.get("stalled_after_ms", 180000)),
+            error_hold_ms=int(cfg.get("error_hold_ms", 3000)),
+            infer_outputting=bool(cfg.get("infer_outputting", False)),
             outputting_after_ms=int(cfg.get("outputting_after_ms", 3500)),
-            infer_need_confirm=bool(cfg.get("infer_need_confirm", True)),
-            need_confirm_after_ms=int(cfg.get("need_confirm_after_ms", 3000)),
-            infer_need_input=bool(cfg.get("infer_need_input", True)),
-            need_input_after_ms=int(cfg.get("need_input_after_ms", 1500)),
             lock_human=bool(cfg.get("lock_human", True)),
         )
         self.link = DeviceLink(cfg, self.log)
@@ -57,7 +55,6 @@ class StatusService:
                 "session": ev.session_id,
                 "state": ev.state,
                 "reason": ev.reason,
-                "watch": ev.watch,
                 "release_sticky": ev.release_sticky,
             })
             returns = self._apply(self.machine.update(ev))

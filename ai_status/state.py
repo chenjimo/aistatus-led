@@ -1,5 +1,9 @@
 """多会话状态仲裁：优先级、粘性状态、最短驻留、自动回落。
 
+v1.3.0 起不再用「静默」推断等待态。IDE 版 PostToolUse 经常缺失，深度思考
+（长时间无事件）会被误判成 need_input / need_confirm。现在状态只由真实事件
+驱动；只有真正卡住超过 stalled_after_ms 才归为 error（红色快闪）。
+
 设备侧只有 1 颗灯且按 prio 拒绝低优先级帧，因此 PC 端必须先做仲裁。
 """
 from __future__ import annotations
@@ -9,6 +13,9 @@ from dataclasses import dataclass, field
 
 from .mapper import StatusEvent
 from .protocol import HUMAN_STATES, default_ttl, is_sticky, is_valid, priority
+
+# AI 仍在本轮工作中（这些状态下长时间静默才算「卡住」）
+WORK_STATES = frozenset({"thinking", "searching", "coding", "outputting"})
 
 
 @dataclass
@@ -30,16 +37,13 @@ class SessionState:
 @dataclass
 class StateMachine:
     min_dwell_ms: int = 300
-    done_hold_ms: int = 5000
-    idle_after_ms: int = 180000
-    infer_outputting: bool = True
+    done_hold_ms: int = 10000        # done 绿色常亮 10s 后回 idle
+    idle_after_ms: int = 600000      # 非工作态长时间无事件回 idle
+    stalled_after_ms: int = 180000   # 工作中卡住 3 分钟 -> error 红色快闪；0 = 关闭
+    error_hold_ms: int = 3000        # 红闪至少显示这么久，之后可由工作事件自动恢复
+    infer_outputting: bool = False   # 默认关闭：无「流式输出」事件，不靠静默猜
     outputting_after_ms: int = 3500
-    # 需要人工介入的推断：IDE 版 Hooks 不发送确认/提问事件，只能靠静默窗口判断
-    infer_need_confirm: bool = True
-    need_confirm_after_ms: int = 3000
-    infer_need_input: bool = True
-    need_input_after_ms: int = 1500
-    lock_human: bool = True        # 等待态建立后，普通事件一律不得覆盖
+    lock_human: bool = True          # 等待态建立后，普通事件不得覆盖
 
     current: str = "idle"
     current_msg: str = ""
@@ -51,7 +55,6 @@ class StateMachine:
     sticky: tuple[str, str, str] | None = None   # (state, session, msg)
     pending: Transition | None = None
     _inferred_outputting: bool = False
-    _watch: tuple[str, float, str] | None = None  # (confirm|input, since, session)
 
     def _resolve(self, now: float) -> tuple[str, str, str]:
         if self.sticky:
@@ -106,45 +109,32 @@ class StateMachine:
     def _release(self, sid: str, now: float, reason: str) -> list[Transition]:
         """用户已处理完等待态：解除粘性并回到工作态，force 覆盖设备端高优先级。"""
         self.sticky = None
-        # 不清 _watch：解除事件常常自带新的观察窗口（如 PostToolUse -> 等回复）。
-        # 但必须清掉所有会话里残留的等待态，否则多会话仲裁会把它重新顶上来，
-        # 造成「sticky 已解除却仍显示 need_input」的失配。
+        # 清掉所有会话里残留的粘性态，否则多会话仲裁会把它重新顶上来
         self.sessions.clear()
         self.sessions[sid] = SessionState("thinking", reason, now)
         target, msg, _ = self._resolve(now)
         return self._transition(target, msg, reason, True, now)
-
-    def _enter_human(self, state: str, msg: str, reason: str,
-                     sid: str, now: float) -> list[Transition]:
-        """静默推断命中：建立最高优先级的粘性等待态。"""
-        if self.sticky and self.sticky[0] in HUMAN_STATES:
-            # 已处于等待态时只允许升级（need_input -> need_confirm）
-            if priority(state) <= priority(self.sticky[0]):
-                return []
-        self._watch = None
-        self.pending = None
-        self.sticky = (state, sid, msg)
-        self.sessions[sid] = SessionState(state, msg, now)
-        # force=1：设备端可能停在 error(90)，必须突破其优先级检查
-        return self._transition(state, msg, reason, True, now)
 
     def update(self, ev: StatusEvent) -> list[Transition]:
         now = time.monotonic()
         self.last_activity = now
         sid = ev.session_id or "default"
 
-        # 静默观察：只有带 watch 的事件开启；任何其它事件都说明「还有活动」，取消观察
-        self._watch = ((ev.watch, now, sid)
-                       if ev.watch in ("confirm", "input") else None)
-        # 新一轮工具调用（PreToolUse）说明用户已经回复、AI 重新开始工作，
-        # 这是「need_input 已处理掉」的明确信号；need_confirm 不能被它解除。
-        release = ev.release_sticky or (self.sticky is not None
-                                       and self.sticky[0] == "need_input"
-                                       and ev.watch == "confirm")
+        # 解除条件全部来自真实事件，没有任何基于时间的猜测：
+        # ① Hook 明确带 release_sticky（用户新需求 / 工具完成 / 一轮完成 / 会话切换）
+        # ② need_input 期间 AI 又开始工作，说明用户已回复
+        # ③ error 红闪显示够 error_hold_ms 后，AI 恢复工作即可自动清除
+        error_recovered = (
+            self.sticky is not None and self.sticky[0] == "error"
+            and ev.state is not None and not is_sticky(ev.state)
+            and now - self.last_change >= self.error_hold_ms / 1000)
+        input_resolved = (
+            self.sticky is not None and self.sticky[0] == "need_input"
+            and ev.state in WORK_STATES)
+        release = ev.release_sticky or error_recovered or input_resolved
         locked = self._human_locked(ev, release)
 
         if ev.state is None:
-            # 只刷新活跃度；但若等待态已被用户处理掉，要立刻解除并回到工作态
             if (release and self.sticky is not None
                     and self.sticky[0] in HUMAN_STATES):
                 return self._release(sid, now, ev.reason)
@@ -154,11 +144,9 @@ class StateMachine:
             # 等待人工处理期间不推任何状态帧，设备端也不会被低优先级帧影响
             return []
 
-        # 粘性状态只能由用户响应 / 会话结束 / 手动 clear 解除（协议第二节）
-        if release:
+        if release and self.sticky is not None:
             self.sticky = None
             self.sessions.clear()
-            # 不清 _watch：PreToolUse 触发的解除仍要继续观察这个工具是否卡在授权
 
         self.sessions[sid] = SessionState(ev.state, ev.msg, now)
         if is_sticky(ev.state):
@@ -181,35 +169,28 @@ class StateMachine:
             self.last_change = now
             return [tr]
 
-        # 人工介入推断：必须早于 outputting / idle 回落，否则等待态会被普通状态盖掉
-        # need_input 尚未处理时仍允许推断升级为 need_confirm（85 > 80）
-        if self._watch and (self.sticky is None
-                            or self.sticky[0] != "need_confirm"):
-            kind, since, sid = self._watch
-            elapsed = now - since
-            if kind == "confirm" and self.infer_need_confirm:
-                if elapsed >= max(self.need_confirm_after_ms, 0) / 1000:
-                    return self._enter_human("need_confirm", "等待用户确认 / 授权（推断）",
-                                             "need_confirm_inferred", sid, now)
-                # 观察窗口内不做 outputting 推断，避免工具仍在执行时被误判成输出中
-                return []
-            if kind == "input" and self.infer_need_input:
-                if elapsed >= max(self.need_input_after_ms, 0) / 1000:
-                    return self._enter_human("need_input", "等待用户回复（推断）",
-                                             "need_input_inferred", sid, now)
-                # 未到阈值：继续往下走，让 outputting 先短暂表现（两段式灯效）
-
         if self.sticky:
             return []
 
         quiet = now - self.last_activity
 
+        # 完成 -> 空闲：10s 到期，force 以压过设备端 done(40) -> idle(10) 的降级检查
         if self.current == "done" and now - self.last_change >= self.done_hold_ms / 1000:
             for item in self.sessions.values():
                 item.state = "idle"
-            return self._transition("idle", "完成状态到期", "done_timeout", False, now)
+            return self._transition("idle", "完成状态到期（10s）", "done_timeout", True, now)
 
-        # Hooks 没有“流式输出中”事件：无工具活动一段时间后推断为输出中（可关闭）
+        # 唯一保留的超时：工作中卡住太久 -> 红色快闪，而不是谎称「需要用户确认/回复」。
+        # 阈值默认 3 分钟，深度思考不会触发；0 可关闭。
+        if (self.stalled_after_ms > 0 and self.current in WORK_STATES
+                and quiet >= self.stalled_after_ms / 1000):
+            msg = "处理时间过长 / 无响应，请检查 AI 是否卡住"
+            self.sticky = ("error", "default", msg)
+            self.sessions.clear()
+            self.sessions["default"] = SessionState("error", msg, now)
+            return self._transition("error", msg, "stalled_timeout", True, now)
+
+        # 可选近似：无「流式输出」事件时按静默推断 outputting，默认关闭
         if (self.infer_outputting and not self._inferred_outputting
                 and self.current in ("thinking", "searching", "coding")
                 and quiet >= self.outputting_after_ms / 1000):
@@ -225,9 +206,9 @@ class StateMachine:
     def clear_sticky(self) -> list[Transition]:
         now = time.monotonic()
         self.sticky = None
-        self._watch = None
         self.sessions.clear()
         self.pending = None
+        self.last_activity = now   # 手动解除后重新给一个完整的卡住检测窗口
         return self._transition("idle", "手动解除粘性状态", "manual_clear", True, now)
 
     def force_state(self, state: str, msg: str = "", force: bool = False) -> list[Transition]:
@@ -246,7 +227,8 @@ class StateMachine:
             "reason": self.current_reason,
             "sticky": self.sticky[0] if self.sticky else None,
             "waiting_for_human": bool(self.sticky and self.sticky[0] in HUMAN_STATES),
-            "watch": self._watch[0] if self._watch else None,
+            "quiet_ms": int((time.monotonic() - self.last_activity) * 1000),
+            "stalled_after_ms": self.stalled_after_ms,
             "sessions": {k: {"state": v.state, "msg": v.msg}
                          for k, v in self.sessions.items()},
             "last_change_ms": int((time.monotonic() - self.last_change) * 1000),

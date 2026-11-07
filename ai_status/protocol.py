@@ -21,7 +21,7 @@ STATE_META: dict[str, tuple[int, bool, int]] = {
     "searching": (25, False, 0),
     "coding": (30, False, 0),
     "outputting": (30, False, 0),
-    "done": (40, False, 5000),
+    "done": (40, False, 10000),   # 绿色完成态保持 10s，TTL 随帧下发给固件
     "need_input": (80, True, 0),
     "need_confirm": (85, True, 0),
     "error": (90, True, 0),
