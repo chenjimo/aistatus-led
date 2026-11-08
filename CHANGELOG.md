@@ -66,6 +66,16 @@
 | v1.4.0 | 2026-11-06 | AI 状态灯引擎、10 个状态、三通道统一承载、`/api/hello`、`/api/status`、CORS、`reqId` |
 | v1.3 | 2026-11-06 | 原生 USB CDC + UART0 双串口桥接、Web 调试面板基线 |
 
+## 附属工具（不改变中间件版本）
+
+### codebuddy-autostart.ps1（2026-11-08）
+
+- 位置 `tools/codebuddy-autostart.ps1`，随 PC 发布包一起分发；**不改变 `ai-status/1` 协议，也不改变 PC 端版本号**（中间件仍为 v1.3.0）。
+- 免管理员的登录自启：写入 HKCU Run，打开 CodeBuddy 时确保 `start.bat` 运行；探 `/health` 做幂等，绝不重复起服务；服务意外退出时最多每 30 秒拉起一次。
+- 自带 `-Install` / `-Uninstall`；`<APP>` 路径由 `$PSScriptRoot` 推导，无硬编码本机路径，整目录复制到新电脑即可用。
+- 修复「安装进程自身命令行被误判为已有监视器」导致装完不启动的问题（匹配条件限定 `-WindowStyle Hidden` 且排除 `-Install` / `-Uninstall`）。
+- 完整使用与验收见 `docs/01` 第 10 节。
+
 ## 协议
 
 `ai-status/1` v1.0.0 自 2026-11-06 起保持不变；v1.5.0 固件**只新增可选字段 `src`**，旧字段语义一字未改，不带 `src` 的旧客户端统一视为匿名来源 `*`，完全向后兼容。

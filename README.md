@@ -63,6 +63,8 @@ aistatus-led/
 ├── config.example.json          ← 配置样例，复制成 config.json 后修改
 ├── requirements.txt             ← 可选依赖（pyserial），不装也能跑
 ├── start.bat                    ← Windows 一键启动
+├── tools/
+│   └── codebuddy-autostart.ps1  ← 打开 CodeBuddy 自动启动服务（含安装/卸载）
 ├── esp32/
 │   ├── README.md                ← 设备端说明入口
 │   └── firmware/
@@ -74,7 +76,7 @@ aistatus-led/
     └── aistatus-led-esp32-v1.5.0.zip   ← 设备端独立发布包
 ```
 
-> 两个 zip 与仓库内容一致，只是去掉了 Git 元数据和文档源码，方便直接拷走。
+> 发布包与仓库内容一致，只是去掉了 Git 元数据，方便直接拷走。
 
 ---
 
@@ -112,6 +114,8 @@ python main.py clear          # 看完后解除
 服务窗口不要关；关掉后设备 15 秒无心跳会自动转 `offline`。
 
 > **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（74 项，不需要硬件）确认升级无误。**v1.2.0 用户请务必升级**：该版会把深度思考误报成等待态。
+
+> **不想每次手动开服务**：跑一次 `powershell -ExecutionPolicy Bypass -File .\tools\codebuddy-autostart.ps1 -Install`，之后每次登录并打开 CodeBuddy 会自动拉起服务（免管理员、幂等、可卸载）。详见 `docs/01` 第 10 节。
 
 ---
 
