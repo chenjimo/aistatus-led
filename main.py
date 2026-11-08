@@ -33,7 +33,9 @@ from ai_status.state import StateMachine
 APP_DIR = Path(__file__).resolve().parent
 
 DEFAULT_CONFIG: dict = {
-    "listen_host": "127.0.0.1",
+    # 0.0.0.0 = 允许手机/小程序在同一局域网直连 8765；
+    # 只想本机使用（更安全）时改回 127.0.0.1
+    "listen_host": "0.0.0.0",
     "listen_port": 8765,
     "heartbeat_ms": 5000,
     "min_dwell_ms": 300,
@@ -436,10 +438,12 @@ def ensure_firewall_rules(cfg: dict) -> dict:
     """放行 TCP 服务端口与 UDP 发现端口；需要管理员，失败不阻断启动。"""
     if sys.platform != "win32":
         return {"ok": False, "reason": "not_windows"}
+    api = int(cfg.get("listen_port", 8765))
     tcp = int(cfg.get("phone_bridge_port", 8770))
     udp = int(cfg.get("phone_bridge_discovery_port", 4211))
     result = {}
-    for name, proto, port in (("AIStatusPhoneBridge-TCP", "TCP", tcp),
+    for name, proto, port in (("AIStatusLed-TCP-API", "TCP", api),
+                              ("AIStatusPhoneBridge-TCP", "TCP", tcp),
                               ("AIStatusPhoneBridge-UDP", "UDP", udp)):
         exists, _ = _netsh(["advfirewall", "firewall", "show", "rule", f"name={name}"])
         if exists:

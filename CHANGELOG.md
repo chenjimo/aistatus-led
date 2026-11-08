@@ -15,6 +15,7 @@
 - **稳定性**：HTTP 断连静默、`/health` 无锁、设备发现移出全局锁、流式事件节流、两处单实例保护。
 - 自检 107 项。新增文档 `docs/06-V2功能与使用说明.md`。
 - 关联手机项目：微信小程序 <https://gitee.com/chenjimo/we-chat-mini-demo>、鸿蒙 <https://gitee.com/chenjimo/harmony-bridge>。
+- **小程序直连 8765**：`listen_host` 默认改 `0.0.0.0`（可改回 `127.0.0.1`），防火墙放行增加 TCP `8765`（规则 `AIStatusLed-TCP-API`）；小程序无需桥接即可选 `pc` 源直连 `/health`、`/events`、`/clear`。小程序侧标注 `APP_VERSION = v2.0.0` 并在连接提示中显示。`8765` 的 `/event` 无鉴权，仅限可信局域网。
 
 ### v1.4.0（2026-11-08）
 
