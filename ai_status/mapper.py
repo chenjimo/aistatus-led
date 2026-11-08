@@ -86,15 +86,38 @@ def _short(value, limit: int = 60) -> str:
     return text[:limit]
 
 
+# CodeBuddy IDE 实测：PostToolUse 的 tool_response 是**纯字符串**而不是 dict，
+# 失败时形如 "Error calling tool: Could not find file 'x'."。
+# 只认这些明确前缀，避免把文件内容里的 "error" 字样误判成失败。
+FAILURE_PREFIXES = (
+    "error calling tool",
+    "tool execution failed",
+    "command failed",
+    "command exited with code",
+    "failed to execute",
+    "permission denied",
+    "operation cancelled",
+    "operation canceled",
+    "request interrupted",
+)
+
+
 def _response_failed(response) -> bool:
     if isinstance(response, dict):
-        if response.get("success") is False or response.get("is_error") is True:
-            return True
-        code = response.get("exitCode", response.get("exit_code"))
-        if isinstance(code, int) and code != 0:
-            return True
-        if response.get("error"):
-            return True
+        for key, value in response.items():
+            norm = _norm_key(key)
+            if norm in ("success", "ok"):
+                if _is_false(value):
+                    return True
+            elif norm in ("is_error", "iserror", "failed", "failure", "error"):
+                if value is True or (isinstance(value, str) and value.strip()):
+                    return True
+            elif norm in ("exitcode", "exit_code"):
+                if isinstance(value, int) and value != 0:
+                    return True
+        return False
+    if isinstance(response, str):
+        return response.strip().lower()[:160].startswith(FAILURE_PREFIXES)
     return False
 
 
@@ -199,7 +222,9 @@ def map_hook(payload: dict, event_hint: str = "") -> StatusEvent:
 
     if event in ("PreToolUse", "PostToolUse"):
         if event == "PostToolUse" and _response_failed(payload.get("tool_response")):
-            return StatusEvent("error", f"工具执行失败：{tool}", session)
+            # 工具真的失败了：必须立刻红闪，并解除之前的等待态（能执行说明已放行）
+            return StatusEvent("error", f"工具执行失败：{tool}", session,
+                               release_sticky=True)
         if event == "PostToolUse":
             # 工具真的跑完了：回到「思考」紫色呼吸，同时说明此前若卡在确认已被处理掉。
             # 这一条也是 need_confirm / need_input / error 的主要解除信号。
@@ -226,10 +251,9 @@ def map_hook(payload: dict, event_hint: str = "") -> StatusEvent:
         return StatusEvent("need_input", "等待用户补充信息", session)
 
     if event == "Stop":
-        # 本轮完成 -> 绿色常亮 10s（TTL 由 PC 帧下发），到期回 idle。
-        # 不解除等待态：用户上一轮明确要求「不处理掉就不能被覆盖」。
-        # 也不再由「静默」升级成 need_input。
-        return StatusEvent("done", "本轮任务完成", session)
+        # 本轮完成 -> 绿色 10s，到期回 idle。
+        # 同时解除等待态：一轮已经结束，说明之前的确认/追问都已处理完。
+        return StatusEvent("done", "本轮任务完成", session, release_sticky=True)
 
     if event in NOOP_EVENTS:
         return StatusEvent(None, f"事件：{event}", session)

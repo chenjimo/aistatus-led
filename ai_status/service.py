@@ -26,7 +26,7 @@ class StatusService:
             min_dwell_ms=int(cfg.get("min_dwell_ms", 300)),
             done_hold_ms=int(cfg.get("done_hold_ms", 10000)),
             idle_after_ms=int(cfg.get("idle_after_ms", 600000)),
-            stalled_after_ms=int(cfg.get("stalled_after_ms", 180000)),
+            stalled_after_ms=int(cfg.get("stalled_after_ms", 0)),
             error_hold_ms=int(cfg.get("error_hold_ms", 3000)),
             infer_outputting=bool(cfg.get("infer_outputting", False)),
             outputting_after_ms=int(cfg.get("outputting_after_ms", 3500)),
@@ -56,6 +56,10 @@ class StatusService:
                 "state": ev.state,
                 "reason": ev.reason,
                 "release_sticky": ev.release_sticky,
+                # 诊断用：IDE 的 tool_response 结构不统一，保留原文才能核对失败判定
+                "tool": str(payload.get("tool_name") or ""),
+                "tool_response": str(payload.get("tool_response"))[:260],
+                "keys": list(payload.keys()),
             })
             returns = self._apply(self.machine.update(ev))
             return {"ok": True, "state": self.machine.snapshot(), "push": returns}

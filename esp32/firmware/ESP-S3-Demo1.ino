@@ -5,7 +5,7 @@
  *            RMT / LEDC / 温度传感器 / esp_flash HAL，避免重型外部依赖
  *
  *  v1.1 变更:
- *  1. WiFi 三级容错: 首选网络 -> 备用 jimo -> 本地 AP，全部失败仍可访问 Web 面板
+ *  1. WiFi 三级容错: 首选网络 -> 备用网络 -> 本地 AP，全部失败仍可访问 Web 面板
  *  2. 移除未安装的 FastLED 依赖，改用 Core 内置 rgbLedWrite() 并自行实现 HSV 转换
  *  3. 修复 WS 回调越界写 data[len]、未处理分片、在异步任务里 restart/delay
  *  4. WiFi 扫描改为异步，不再在 async_tcp 任务中阻塞数秒
@@ -14,7 +14,7 @@
  *  7. 恢复 ESP32-S3 真实芯片温度读取，串口接收改为非阻塞按行解析
  *
  *  v1.2 变更:
- *  8. 主网络与备用网络为占位符，使用前填写自己的 2.4GHz WiFi
+ *  8. 主网络改 YOUR_WIFI_SSID 固定为永久备用
  *  9. 自定义 WiFi 通过 ESP-IDF 原生 NVS API 持久化，开机默认优先连接
  * 10. Web 面板新增配置表单，AP 模式下亦可保存/清除并即时生效
  *
@@ -55,6 +55,17 @@
  *     启动先快发 3 次；检查 beginPacket/endPacket 返回值并累计成功/失败
  * 35. hello 增加 udpBeaconCount/Ok/Fail/udpLastErrno/broadcastIP；
  *     新增 GET /api/discover 主动触发(可选 peer 单播对照)
+ *
+ *  v1.5.0 灯效可配置版 (协议 ai-status/1、fw 版本号不变，以源码 hash 区分):
+ * 36. 默认灯效重做：工作态(思考/找资料/编写/输出/完成)偏暗，交互态
+ *     (需补充/需确认/失败)明显更亮；新增「双色渐变呼吸」效果 FX_GRADIENT
+ * 37. 空闲暗蓝、思考深紫慢渐变呼吸、找资料绿黄渐变呼吸、编写青蓝呼吸、
+ *     输出渐变流动、完成绿色慢闪 10s、需补充粉色快闪、需确认橙色快闪、失败红色急闪
+ * 38. 每个状态的颜色1/颜色2/效果/亮度/周期均可在网页单独配置，NVS blob 持久化，
+ *     开机自动恢复；新增 GET|POST /api/fx 与「恢复默认灯效」
+ * 39. 网页「AI 状态灯」卡片每个状态名旁显示配置色块与闪烁方式，点开可编辑并保存
+ * 40. 网页卡片标题可拖动排序，localStorage 记忆；页头「↺ 重置排序」恢复默认顺序
+ * 41. 灯效配置收进默认折叠面板，缩略行显示状态数与全局亮度，点开才展开编辑
  ***********************************************************************/
 
 #include <Arduino.h>
@@ -129,38 +140,72 @@ struct WifiCredential {
 #define DISCOVERY_FAST_MS     3000     // 快发间隔
 #define DISCOVERY_HOST        "esp32s3-ai"   // mDNS: esp32s3-ai.local
 
-#define FX_SOLID        0
-#define FX_BREATHE      1
-#define FX_BLINK        2
-#define FX_FLOW         3
-#define FX_DOUBLE_BLINK 4
+#define FX_SOLID        0    // 常亮
+#define FX_BREATHE      1    // 单色明暗呼吸
+#define FX_BLINK        2    // 亮/暗闪烁
+#define FX_FLOW         3    // 双色渐变流动
+#define FX_DOUBLE_BLINK 4    // 双闪
+#define FX_GRADIENT     5    // 双色渐变呼吸（v1.5.0-fx 新增）
+#define FX_COUNT        6
+
+// 效果名：网页下拉与状态列表显示用，顺序与上面宏一致
+static const char *const FX_NAMES[FX_COUNT] = {
+  "常亮", "呼吸", "闪烁", "渐变流动", "双闪", "渐变呼吸"
+};
+
+// ---- 每个状态的显示配置（网页可编辑，NVS blob 持久化） ----
+// 颜色用 RGB，便于网页 <input type="color"> 直接编辑；level 是相对亮度百分比
+struct StatusFx {
+  uint8_t  r1, g1, b1;      // 主色
+  uint8_t  r2, g2, b2;      // 辅色（渐变/流动时用到）
+  uint8_t  fx;              // 效果枚举
+  uint8_t  level;           // 亮度 0~100（工作态低、交互态高）
+  uint16_t periodMs;        // 动效周期
+};
 
 struct StatusDef {
-  const char *name;
+  const char *name;         // 协议状态名
+  const char *label;        // 网页中文名
   uint8_t  prio;
   bool     sticky;
   uint32_t ttlMs;
-  uint8_t  h, s, v;
-  uint8_t  fx;
-  uint16_t periodMs;
 };
 
 // 顺序即索引，0=offline / 1=idle 供内部转移使用
 static const StatusDef STATUS_DEFS[] = {
-  {"offline",      0,  false, 0,    160, 255, 20,  FX_SOLID,        0},
-  {"idle",        10,  false, 0,    160, 255, 70,  FX_SOLID,        0},
-  {"thinking",    20,  false, 0,    200, 255, 180, FX_BREATHE,   2000},
-  {"searching",   25,  false, 0,     45, 255, 180, FX_BLINK,     1200},
-  {"coding",      30,  false, 0,    125, 255, 180, FX_BREATHE,    800},
-  {"outputting",  30,  false, 0,    128, 255, 180, FX_FLOW,      3000},
-  {"done",        40,  false, 5000,  85, 255, 180, FX_SOLID,        0},
-  {"need_input",  80,  true,  0,    240, 120, 220, FX_DOUBLE_BLINK,1400},
-  {"need_confirm",85,  true,  0,     25, 255, 200, FX_BLINK,      500},
-  {"error",       90,  true,  0,      0, 255, 200, FX_BLINK,      240},
+  {"offline",      "离线",   0,  false, 0},
+  {"idle",         "空闲",  10,  false, 0},
+  {"thinking",     "思考",  20,  false, 0},
+  {"searching",    "找资料",25,  false, 0},
+  {"coding",       "编写",  30,  false, 0},
+  {"outputting",   "输出",  30,  false, 0},
+  {"done",         "完成",  40,  false, 10000},  // 绿色慢闪 10s 后自动回 idle
+  {"need_input",   "需补充",80,  true,  0},
+  {"need_confirm", "需确认",85,  true,  0},
+  {"error",        "失败",  90,  true,  0},
 };
 #define STATUS_COUNT (sizeof(STATUS_DEFS) / sizeof(STATUS_DEFS[0]))
 #define ST_OFFLINE 0
 #define ST_IDLE    1
+
+#define STATUS_FX_KEY   "fx_v1"    // NVS blob 键
+#define STATUS_FX_VER   1          // 配置结构版本
+
+// v1.5.0-fx 默认灯效：工作态偏暗、需要交互时明显更亮
+static const StatusFx STATUS_FX_DEFAULT[STATUS_COUNT] = {
+  // 主色 R G B      辅色 R G B     效果         亮度  周期ms
+  {  5, 10, 20,      5, 10, 20,  FX_SOLID,       18,     0},  // 离线：极暗蓝
+  { 10, 30, 90,     10, 30, 90,  FX_SOLID,       30,     0},  // 空闲：暗蓝
+  { 42,  8, 70,     90, 24,144,  FX_GRADIENT,    38,  3000},  // 思考：深紫慢渐变呼吸
+  { 10, 90, 42,    122,106, 10,  FX_GRADIENT,    38,  1800},  // 找资料：绿黄渐变呼吸
+  { 10,110,140,     10,110,140,  FX_BREATHE,     40,  1200},  // 编写：青蓝呼吸
+  { 10, 58,106,     16,160,160,  FX_FLOW,        40,  3000},  // 输出：渐变流动
+  { 26,160, 58,     26,160, 58,  FX_BLINK,       55,  1000},  // 完成：绿色慢闪 10s
+  {255, 79,168,    255, 79,168,  FX_BLINK,       95,   500},  // 需补充：粉色快闪
+  {255,138, 26,    255,138, 26,  FX_BLINK,      100,   500},  // 需确认：橙色快闪
+  {255, 32, 32,    255, 32, 32,  FX_BLINK,      100,   240},  // 失败：红色急闪
+};
+static StatusFx g_statusFx[STATUS_COUNT];   // 运行时配置：开机从 NVS 恢复，否则用默认值
 
 #define AP_SSID               "ESP32S3-Fallback"
 #define AP_PASSWORD           "YOUR_AP_PASSWORD"
@@ -321,6 +366,11 @@ bool handleSerialProtocolLine(const String &raw, Stream &port, const char *tag);
 void sendJsonResponse(AsyncWebServerRequest *request, int code, const String &body);
 void loadStatusBrightness();
 bool setStatusBrightness(uint8_t value);
+void loadStatusFx();                 // v1.5.0-fx：开机恢复每个状态的灯效配置
+bool saveStatusFx();
+bool resetStatusFx();
+String getStatusFxJson();
+bool setStatusFxItem(JsonObject o, String &reason);
 void loadBindConfig();
 bool saveBindConfig();
 void normalizeSrc(const char *raw, char *out, size_t outLen);
@@ -420,6 +470,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .usb-stats{font-size:.72em;color:var(--text2);margin-top:8px;font-family:'Courier New',monospace}
 .status-grid{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
 .status-pill{padding:3px 9px;border-radius:12px;font-size:.72em;font-weight:600;border:1px solid var(--border);background:var(--bg)}
+.fx-list{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.fx-row{border:1px solid var(--border);border-radius:10px;background:var(--bg);padding:6px 8px}
+.fx-head{display:flex;align-items:center;gap:8px;cursor:pointer;flex-wrap:wrap}
+.fx-swatch{width:18px;height:18px;border-radius:5px;border:1px solid var(--border);flex:none;box-shadow:0 0 8px rgba(255,255,255,.12)}
+.fx-name{font-size:.8em;font-weight:600;min-width:52px}
+.fx-desc{font-size:.7em;color:var(--text2);flex:1;min-width:110px}
+.fx-edit{display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);gap:8px;flex-wrap:wrap;align-items:center}
+.fx-edit.open{display:flex}
+.fx-edit label{font-size:.72em;color:var(--text2);display:flex;align-items:center;gap:4px}
+.fx-edit input[type=color]{width:38px;height:26px;border:1px solid var(--border);border-radius:5px;background:none;cursor:pointer;padding:1px}
+.fx-edit input[type=range]{width:90px}
+.fx-edit input[type=number]{width:66px;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:3px}
+.fx-edit select{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:3px;font-size:.75em}
 .usb-terminal{background:#000;border-radius:8px;padding:10px;font-family:'Courier New',monospace;font-size:.8em;max-height:150px;overflow-y:auto;margin-bottom:10px;min-height:80px;color:#0f0}
 .usb-input-row{display:flex;gap:8px}
 .usb-input-row input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:.85em;outline:none}
@@ -432,19 +495,31 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .wifi-cfg-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
 .wifi-cfg input{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:6px 9px;color:var(--text);font-size:.8em;outline:none;flex:1;min-width:110px}
 .wifi-cfg input:focus{border-color:var(--accent)}
+.card-title[draggable]{cursor:grab;user-select:none}
+.card-title[draggable]:active{cursor:grabbing}
+.drag-handle{margin-left:6px;color:var(--text2);font-size:1.05em;letter-spacing:1px;opacity:.75}
+.card.dragging{opacity:.45;outline:2px dashed var(--accent)}
+.card.drag-over{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 16px rgba(59,130,246,.35)}
+.fold{border:1px solid var(--border);border-radius:10px;background:var(--bg);padding:6px 10px;margin-bottom:8px}
+.fold>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;font-size:.8em;font-weight:600;user-select:none}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::before{content:'▸';color:var(--text2);transition:transform .2s}
+.fold[open]>summary::before{transform:rotate(90deg)}
+.fold-body{padding-top:8px}
 ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>🔧 ESP32-S3 全能调试面板</h1>
-  <div class="subtitle">WebSocket 实时通信 · 全功能硬件调试</div>
+  <div class="subtitle">WebSocket 实时通信 · 全功能硬件调试 · 拖动卡片标题可排序</div>
   <div class="status-bar">
     <div class="status-item"><span class="status-dot online" id="wsDot"></span><span id="wsStatus">已连接</span></div>
     <div class="status-item" style="color:var(--cyan);font-weight:600" id="ipDisplay">IP: --</div>
     <div class="status-item" id="uptimeInfo">运行: --</div>
     <div class="status-item" id="freeMem">内存: --</div>
     <div class="status-item" id="chipTemp">温度: --</div>
+    <div class="status-item" style="cursor:pointer" onclick="resetCardOrder()" title="恢复默认卡片顺序">↺ 重置排序</div>
   </div>
 </div>
 <div class="grid">
@@ -474,17 +549,17 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <button class="btn btn-warning btn-sm" onclick="sendCmd('status_enable',0)">停用</button>
       <button class="btn btn-danger btn-sm" onclick="sendCmd('status_clear',1)">清除状态</button>
     </div>
-    <div class="status-grid">
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('idle')">空闲</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('thinking')">思考</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('searching')">找资料</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('coding')">编写</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('outputting')">输出</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('done')">完成</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('need_input')">待回复</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('need_confirm')">待确认</span>
-      <span class="status-pill" style="cursor:pointer" onclick="setStatus('error')">异常</span>
-    </div>
+    <details class="fold" id="fxFold">
+      <summary><span id="fxSummary">灯效配置 · 正在读取…</span></summary>
+      <div class="fold-body">
+        <div class="fx-list" id="fxList"><div style="text-align:center;color:var(--text2);padding:12px;font-size:.8em">正在读取灯效配置…</div></div>
+        <div class="status-grid">
+          <button class="btn btn-primary btn-sm" onclick="loadFx()">刷新灯效</button>
+          <button class="btn btn-warning btn-sm" onclick="if(confirm('把所有状态恢复为默认灯效？'))resetFx()">恢复默认灯效</button>
+        </div>
+        <div class="usb-stats" style="margin-top:0;margin-bottom:8px">点状态名可切灯预览；「配置」可改颜色与闪烁方式并保存到设备</div>
+      </div>
+    </details>
     <div class="slider-group" style="margin-top:10px;margin-bottom:4px">
       <div class="slider-label"><span>💡 状态灯亮度（写入 NVS，开机保留）</span><span id="statusBrightVal">100%</span></div>
       <input type="range" id="statusBrightness" min="0" max="255" value="255" style="background:linear-gradient(to right,#000,#fff)" oninput="setStatusBrightness()">
@@ -637,6 +712,69 @@ let statusSeq=0;function setStatus(s){statusSeq++;sendCmd('status_set',{state:s,
 function updateStatus(d){document.getElementById('statusBadge').textContent=d.state;document.getElementById('statusInfo').textContent='seq='+d.seq+' | prio='+d.prio+' | link='+d.link+' | sticky='+d.sticky+' | src='+(d.src||'*')+' | since='+d.since_ms+'ms'}
 function updateSources(d){if(!d)return;const b=document.getElementById('bindModeBadge');if(b)b.textContent=d.mode==1?'仅绑定来源':'全部接受';const l=document.getElementById('sourcesList');if(!l)return;const sq=t=>esc(t==null?'':t).replace(/'/g,'&#39;');const list=d.sources||[];if(!list.length){l.innerHTML='<div style="text-align:center;color:var(--text2);padding:12px;">暂无来源，等待 PC 端上报状态…</div>';return}l.innerHTML=list.map(s=>{const age=Math.round((s.age_ms||0)/1000),on=!!s.bound,c=s.online?'var(--green)':'var(--text2)',bd=on?'var(--accent)':'rgba(255,255,255,.12)';return`<div style="display:flex;align-items:center;gap:8px;padding:8px;border:1px solid ${bd};border-radius:8px;flex-wrap:wrap;"><label style="display:flex;align-items:center;gap:6px;cursor:pointer;min-width:120px;flex:1;"><input type="checkbox" ${on?'checked':''} onchange="toggleBind('${sq(s.src)}',this.checked)"><span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(s.src)}</span></label><span style="color:${c};font-size:.8em;">● ${esc(s.state)}</span><span style="font-size:.7em;color:var(--text2);">${age}s前</span><span style="font-size:.7em;color:var(--text2);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(s.msg||'')}">${esc(s.msg||'')}</span></div>`}).join('')}
 function toggleBind(src,on){sendCmd('status_bind',{src:src,on:on?1:0})}
+let dragCard=null;
+const CARD_ORDER_KEY='esp32_card_order_v1';
+function resetCardOrder(){localStorage.removeItem(CARD_ORDER_KEY);location.reload()}
+function saveCardOrder(){const g=document.querySelector('.grid');if(!g)return;localStorage.setItem(CARD_ORDER_KEY,JSON.stringify([...g.querySelectorAll(':scope > .card')].map(c=>c.dataset.card||'')))}
+function initCardDrag(){
+  const grid=document.querySelector('.grid');if(!grid)return;
+  [...grid.querySelectorAll(':scope > .card')].forEach((c,i)=>{
+    const t=c.querySelector('.card-title');if(!t)return;
+    const key=(t.textContent||'').replace(/\s+/g,'').slice(0,24)||('card'+i);
+    c.dataset.card=key;
+    t.setAttribute('draggable','true');
+    t.title='按住拖动可调整这张卡片的位置';
+    if(!t.querySelector('.drag-handle')){const h=document.createElement('span');h.className='drag-handle';h.textContent='⠿';t.appendChild(h)}
+    t.addEventListener('dragstart',e=>{dragCard=c;c.classList.add('dragging');e.dataTransfer.effectAllowed='move';try{e.dataTransfer.setData('text/plain',key)}catch(_){}});
+    t.addEventListener('dragend',()=>{c.classList.remove('dragging');document.querySelectorAll('.card.drag-over').forEach(x=>x.classList.remove('drag-over'));saveCardOrder()});
+    c.addEventListener('dragover',e=>{if(!dragCard||dragCard===c)return;e.preventDefault();c.classList.add('drag-over');const r=c.getBoundingClientRect();const after=(e.clientY-r.top)>r.height/2;grid.insertBefore(dragCard,after?c.nextSibling:c)});
+    c.addEventListener('dragleave',()=>c.classList.remove('drag-over'));
+    c.addEventListener('drop',e=>{e.preventDefault();c.classList.remove('drag-over')});
+  });
+  try{const order=JSON.parse(localStorage.getItem(CARD_ORDER_KEY)||'[]');order.forEach(k=>{const el=[...grid.querySelectorAll(':scope > .card')].find(x=>x.dataset.card===k);if(el)grid.appendChild(el)})}catch(_){}
+}
+let fxData=null;
+function fxPeriodText(p){return p>0?(p/1000).toFixed(1)+'s':'—'}
+function loadFx(){fetch('/api/fx').then(r=>r.json()).then(d=>{if(d&&d.states)renderFx(d);else document.getElementById('fxList').textContent='配置读取失败'}).catch(e=>{document.getElementById('fxList').textContent='灯效配置读取失败：'+e.message})}
+function renderFx(d){
+  fxData=d;const el=document.getElementById('fxList');
+  const sum=document.getElementById('fxSummary');
+  if(sum)sum.textContent='灯效配置（'+d.states.length+' 个状态）· 全局亮度 '+Math.round((d.brightness||0)/255*100)+'% · 点开可改颜色与闪烁';
+  el.innerHTML=d.states.map((s,i)=>{
+    const grad='linear-gradient(135deg,'+s.color1+' 0%,'+(s.color2||s.color1)+' 100%)';
+    const opts=d.fxNames.map((n,j)=>'<option value="'+j+'"'+(j===s.fx?' selected':'')+'>'+esc(n)+'</option>').join('');
+    return `<div class="fx-row">
+      <div class="fx-head" onclick="setStatus('${s.key}')" title="点一下把灯切到这个状态预览">
+        <span class="fx-swatch" style="background:${grad}"></span>
+        <span class="fx-name">${esc(s.label)}</span>
+        <span class="fx-desc">${esc(s.fxName)} · ${fxPeriodText(s.periodMs)} · 亮度 ${s.level}%</span>
+        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation();toggleFxEdit(${i})">配置</button>
+      </div>
+      <div class="fx-edit" id="fxEdit${i}">
+        <label>主色 <input type="color" id="fxC1_${i}" value="${s.color1}"></label>
+        <label>辅色 <input type="color" id="fxC2_${i}" value="${s.color2}"></label>
+        <label>效果 <select id="fxSel_${i}">${opts}</select></label>
+        <label>亮度 <input type="range" id="fxLv_${i}" min="5" max="100" value="${s.level}" oninput="document.getElementById('fxLvT_${i}').textContent=this.value+'%'"><span id="fxLvT_${i}">${s.level}%</span></label>
+        <label>周期ms <input type="number" id="fxPd_${i}" min="0" max="10000" step="100" value="${s.periodMs}"></label>
+        <button class="btn btn-success btn-sm" onclick="saveFx(${i})">保存到设备</button>
+        <button class="btn btn-warning btn-sm" onclick="setStatus('${s.key}')">预览灯效</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+function toggleFxEdit(i){const e=document.getElementById('fxEdit'+i);if(e)e.classList.toggle('open')}
+function saveFx(i){
+  const s=fxData.states[i];
+  const body={key:s.key,c1:document.getElementById('fxC1_'+i).value,c2:document.getElementById('fxC2_'+i).value,fx:+document.getElementById('fxSel_'+i).value,level:+document.getElementById('fxLv_'+i).value,periodMs:+document.getElementById('fxPd_'+i).value};
+  fetch('/api/fx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{if(d.ok){renderFx(d);appendTerminal('→ 灯效已保存：'+s.label)}else{appendTerminal('← 保存失败：'+(d.reason||'unknown'))}})
+    .catch(e=>appendTerminal('← 保存失败：'+e.message));
+}
+function resetFx(){
+  fetch('/api/fx',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"reset":1}'})
+    .then(r=>r.json()).then(d=>{if(d.ok){renderFx(d);appendTerminal('→ 已恢复默认灯效')}else{appendTerminal('← 恢复失败：'+(d.reason||'unknown'))}})
+    .catch(e=>appendTerminal('← 恢复失败：'+e.message));
+}
 let statusBrightTimer=null,statusBrightInit=false;
 function setStatusBrightness(){const v=+document.getElementById('statusBrightness').value;document.getElementById('statusBrightVal').textContent=Math.round(v/255*100)+'%';clearTimeout(statusBrightTimer);statusBrightTimer=setTimeout(()=>sendCmd('status_brightness',v),80)}
 function initStatusBrightness(v){if(statusBrightInit)return;const e=document.getElementById('statusBrightness');if(e){e.value=v;document.getElementById('statusBrightVal').textContent=Math.round(v/255*100)+'%';statusBrightInit=true}}
@@ -651,7 +789,7 @@ function loadRandomPattern(){clearCanvas();aiCtx.strokeStyle='#fff';aiCtx.lineWi
 function runAIInference(){const img=aiCtx.getImageData(0,0,160,160),f=[];for(let by=0;by<4;by++)for(let bx=0;bx<4;bx++){let s=0;for(let dy=0;dy<40;dy++)for(let dx=0;dx<40;dx++)s+=img.data[((by*40+dy)*160+(bx*40+dx))*4];f.push(s/(40*40*255))}document.getElementById('aiInferTime').textContent='推理中...';sendCmd('ai_infer',f)}
 function updateAIResults(d){document.getElementById('aiInferTime').textContent='推理耗时: '+(d.time_ms||'--')+'ms';const c=['var(--green)','var(--accent)','var(--orange)','var(--accent2)'],l=d.labels||['圆形','方形','三角','星形'],p=d.probs||[.25,.25,.25,.25],m=p.indexOf(Math.max(...p));document.getElementById('aiResults').innerHTML=p.map((v,i)=>`<div class="ai-result-item" style="${i===m?'border:1px solid '+c[i]:''}"><div class="ai-result-label">${esc(l[i])}</div><div class="ai-result-bar"><div class="ai-result-fill" style="width:${(v*100).toFixed(0)}%;background:${c[i]}"></div></div><div class="ai-result-pct" style="color:${c[i]}">${(v*100).toFixed(1)}%</div></div>`).join('')}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-window.addEventListener('load',()=>{connectWS();initTouchGrid();updateAIResults({probs:[.25,.25,.25,.25],labels:['圆形','方形','三角','星形'],time_ms:0});updateLED();setInterval(()=>sendCmd('touch_read',1),200);setInterval(()=>sendCmd('gpio_read',1),1000);setInterval(()=>sendCmd('sys_info',1),3000)});
+window.addEventListener('load',()=>{connectWS();loadFx();initCardDrag();initTouchGrid();updateAIResults({probs:[.25,.25,.25,.25],labels:['圆形','方形','三角','星形'],time_ms:0});updateLED();setInterval(()=>sendCmd('touch_read',1),200);setInterval(()=>sendCmd('gpio_read',1),1000);setInterval(()=>sendCmd('sys_info',1),3000)});
 </script>
 </body>
 </html>
@@ -703,9 +841,10 @@ void setup() {
   initAIModel();
 
   loadStatusBrightness();     // 从 NVS 恢复状态灯亮度
+  loadStatusFx();             // v1.5.0-fx：恢复每个状态的颜色/动效配置
   loadBindConfig();           // v1.5.0：恢复绑定模式与白名单
 
-  // ============ WiFi: 自定义 -> 默认 -> jimo(备用) -> AP 兜底 ============
+  // ============ WiFi: 自定义 -> 默认 -> 备用网络 -> AP 兜底 ============
   rebuildWifiList();
   setupWifi();
 
@@ -751,6 +890,39 @@ void setup() {
     sendDiscoveryBeacon(bcast);
     sendJsonResponse(request, 200, getDiscoveryDiagJson());
   });
+
+  // ---- v1.5.0-fx：每个状态的颜色/动效配置（网页可编辑，NVS 持久化） ----
+  server.on("/api/fx", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sendJsonResponse(request, 200, getStatusFxJson());
+  });
+  server.on("/api/fx", HTTP_OPTIONS, [](AsyncWebServerRequest *request) {
+    AsyncWebServerResponse *r = request->beginResponse(204);
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    r->addHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    r->addHeader("Access-Control-Allow-Headers", "Content-Type");
+    request->send(r);
+  });
+  server.addHandler(new AsyncCallbackJsonWebHandler("/api/fx",
+    [](AsyncWebServerRequest *request, JsonVariant &json) {
+      JsonObject o = json.as<JsonObject>();
+      if (o.isNull()) {
+        sendJsonResponse(request, 200, "{\"ok\":false,\"reason\":\"invalid_json\"}");
+        return;
+      }
+      String reason;
+      bool ok = (o["reset"].as<int>() != 0)
+              ? resetStatusFx() : setStatusFxItem(o, reason);
+      if (!ok && !reason.length()) reason = "nvs_write_failed";
+      if (ok) {
+        sendJsonResponse(request, 200, getStatusFxJson());
+      } else {
+        JsonDocument e;
+        e["ok"] = false;
+        e["reason"] = reason;
+        String out; serializeJson(e, out);
+        sendJsonResponse(request, 200, out);
+      }
+    }));
 
   server.on("/api/status", HTTP_OPTIONS, [](AsyncWebServerRequest *request) {
     AsyncWebServerResponse *r = request->beginResponse(204);
@@ -933,7 +1105,7 @@ void handleWsMessage(AsyncWebSocketClient *client, char *data) {
   }
   else if (strcmp(cmd, "wifi_retry") == 0) {
     if (!g_wifiTrying) beginStaAttempt(0);
-    broadcastUSB("[WiFi] 已触发重新连接: 自定义 → 默认 → jimo → AP");
+    broadcastUSB("[WiFi] 已触发重新连接: 自定义 → 默认 → 备用网络 → AP");
   }
   else if (strcmp(cmd, "wifi_save") == 0) {
     JsonObject cfg = doc["val"];
@@ -964,7 +1136,7 @@ void handleWsMessage(AsyncWebSocketClient *client, char *data) {
   else if (strcmp(cmd, "wifi_clear") == 0) {
     nvsClearWifi();
     rebuildWifiList();
-    broadcastUSB("[WiFi] ✅ 已清除自定义网络，恢复默认网络链 → AP");
+    broadcastUSB("[WiFi] ✅ 已清除自定义网络，恢复: YOUR_WIFI_SSID → 备用网络 → AP");
     g_wifiApplyAtMs = millis() + 600;
   }
   else if (strcmp(cmd, "led_color") == 0) {
@@ -1812,6 +1984,123 @@ bool setStatusBrightness(uint8_t value) {
   return e2 == ESP_OK;
 }
 
+// ---- v1.5.0-fx：每个状态的颜色/动效配置（NVS blob，开机恢复） ----
+static uint8_t mixRgb(uint8_t a, uint8_t b, uint8_t t) {
+  return (uint8_t)(((uint32_t)a * (255 - t) + (uint32_t)b * t) / 255);
+}
+
+static bool parseHexColor(const char *hex, uint8_t &r, uint8_t &g, uint8_t &b) {
+  if (!hex || hex[0] != '#' || strlen(hex) != 7) return false;
+  char *end = nullptr;
+  uint32_t v = strtoul(hex + 1, &end, 16);
+  if (!end || *end) return false;
+  r = (v >> 16) & 0xFF; g = (v >> 8) & 0xFF; b = v & 0xFF;
+  return true;
+}
+
+static String colorToHex(uint8_t r, uint8_t g, uint8_t b) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%02X%02X%02X", r, g, b);
+  return String(buf);
+}
+
+static void sanitizeStatusFx() {
+  for (size_t i = 0; i < STATUS_COUNT; i++) {
+    StatusFx &f = g_statusFx[i];
+    if (f.fx >= FX_COUNT) f.fx = FX_SOLID;
+    if (f.level > 100) f.level = 100;
+    if (f.periodMs > 10000) f.periodMs = 10000;
+  }
+}
+
+void loadStatusFx() {
+  memcpy(g_statusFx, STATUS_FX_DEFAULT, sizeof(g_statusFx));
+  if (!nvsInit()) return;
+  nvs_handle_t h;
+  if (nvs_open(STATUS_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+  StatusFx tmp[STATUS_COUNT];
+  size_t len = sizeof(tmp);
+  if (nvs_get_blob(h, STATUS_FX_KEY, tmp, &len) == ESP_OK && len == sizeof(tmp)) {
+    memcpy(g_statusFx, tmp, sizeof(g_statusFx));
+    sanitizeStatusFx();
+    Serial.println("[状态灯] NVS 灯效配置已恢复");
+  } else {
+    Serial.println("[状态灯] 使用默认灯效（工作态暗 / 交互态亮）");
+  }
+  nvs_close(h);
+}
+
+bool saveStatusFx() {
+  if (!nvsInit()) return false;
+  nvs_handle_t h;
+  if (nvs_open(STATUS_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+  esp_err_t e1 = nvs_set_blob(h, STATUS_FX_KEY, g_statusFx, sizeof(g_statusFx));
+  esp_err_t e2 = (e1 == ESP_OK) ? nvs_commit(h) : e1;
+  nvs_close(h);
+  return e2 == ESP_OK;
+}
+
+bool resetStatusFx() {
+  memcpy(g_statusFx, STATUS_FX_DEFAULT, sizeof(g_statusFx));
+  return saveStatusFx();
+}
+
+String getStatusFxJson() {
+  JsonDocument doc;
+  doc["ok"]        = true;
+  doc["version"]   = STATUS_FX_VER;
+  doc["brightness"] = g_statusBrightness;
+  JsonArray names = doc["fxNames"].to<JsonArray>();
+  for (uint8_t i = 0; i < FX_COUNT; i++) names.add(FX_NAMES[i]);
+  JsonArray arr = doc["states"].to<JsonArray>();
+  for (size_t i = 0; i < STATUS_COUNT; i++) {
+    const StatusDef &d = STATUS_DEFS[i];
+    const StatusFx &f = g_statusFx[i];
+    JsonObject o = arr.add<JsonObject>();
+    o["key"]      = d.name;
+    o["label"]    = d.label;
+    o["prio"]     = d.prio;
+    o["sticky"]   = d.sticky;
+    o["ttlMs"]    = d.ttlMs;
+    o["color1"]   = colorToHex(f.r1, f.g1, f.b1);
+    o["color2"]   = colorToHex(f.r2, f.g2, f.b2);
+    o["fx"]       = f.fx;
+    o["fxName"]   = FX_NAMES[f.fx < FX_COUNT ? f.fx : 0];
+    o["level"]    = f.level;
+    o["periodMs"] = f.periodMs;
+  }
+  String out; serializeJson(doc, out); return out;
+}
+
+bool setStatusFxItem(JsonObject o, String &reason) {
+  int idx = findStatusIndex(o["key"].as<const char*>());
+  if (idx < 0) { reason = "unknown_state"; return false; }
+  StatusFx f = g_statusFx[idx];
+  const char *c1 = o["c1"].as<const char*>();
+  const char *c2 = o["c2"].as<const char*>();
+  if (c1 && !parseHexColor(c1, f.r1, f.g1, f.b1)) { reason = "bad_color1"; return false; }
+  if (c2 && !parseHexColor(c2, f.r2, f.g2, f.b2)) { reason = "bad_color2"; return false; }
+  if (!o["fx"].isNull()) {
+    int fx = o["fx"].as<int>();
+    if (fx < 0 || fx >= FX_COUNT) { reason = "bad_fx"; return false; }
+    f.fx = (uint8_t)fx;
+  }
+  if (!o["level"].isNull()) {
+    int lv = o["level"].as<int>();
+    if (lv < 0 || lv > 100) { reason = "bad_level"; return false; }
+    f.level = (uint8_t)lv;
+  }
+  if (!o["periodMs"].isNull()) {
+    int p = o["periodMs"].as<int>();
+    if (p < 0 || p > 10000) { reason = "bad_period"; return false; }
+    f.periodMs = (uint16_t)p;
+  }
+  g_statusFx[idx] = f;                 // 本次立即生效
+  if (!saveStatusFx()) { reason = "nvs_write_failed"; return false; }
+  reason = "";
+  return true;
+}
+
 int findStatusIndex(const char *state) {
   if (!state) return -1;
   for (size_t i = 0; i < STATUS_COUNT; i++) {
@@ -1907,37 +2196,52 @@ void checkStatusTimeout(uint32_t now) {
 
 void renderStatus(uint32_t now) {
   if (!ledOn) { showRgb(0, 0, 0); return; }
-  const StatusDef &s = STATUS_DEFS[g_statusIdx];
-  uint16_t period = (s.periodMs > 0) ? s.periodMs : 1000;
+  const StatusFx &f = g_statusFx[g_statusIdx];
+  uint16_t period = (f.periodMs > 0) ? f.periodMs : 1000;
   uint32_t elapsed = now - g_statusSinceMs;
   uint32_t phase = elapsed % period;
-  uint8_t h = s.h, sat = s.s, v = s.v;
+  uint32_t half = (period > 1) ? period / 2 : 1;
+  uint8_t scale = 255;    // 动效明暗系数
+  uint8_t mix   = 0;      // 主色 -> 辅色插值
 
-  switch (s.fx) {
-    case FX_BREATHE: {
-      uint32_t half = period / 2;
+  switch (f.fx) {
+    case FX_BREATHE: {                       // 单色明暗呼吸
       uint32_t tri = (phase < half) ? phase : (period - phase);
-      v = (uint8_t)((uint32_t)s.v * tri / half);
-      if (v < 20) v = 20;
+      scale = (uint8_t)((uint32_t)255 * tri / half);
+      if (scale < 20) scale = 20;
       break;
     }
-    case FX_BLINK:
-      v = (phase < period / 2) ? s.v : 20;
+    case FX_BLINK:                           // 闪烁：亮 / 暗
+      scale = (phase < half) ? 255 : 20;
       break;
-    case FX_FLOW:
-      h = (uint8_t)(s.h + (uint32_t)255 * phase / period);
-      break;
-    case FX_DOUBLE_BLINK: {
-      uint32_t p = elapsed % 1400;
-      v = (p < 300 || (p >= 400 && p < 700)) ? s.v : 20;
+    case FX_DOUBLE_BLINK: {                  // 双闪
+      uint32_t p = elapsed % period;
+      scale = (p < period / 6 || (p >= period / 3 && p < period / 2)) ? 255 : 20;
       break;
     }
-    default: break;
+    case FX_GRADIENT: {                      // 双色渐变呼吸：颜色来回过渡 + 轻微明暗
+      uint32_t tri = (phase < half) ? phase : (period - phase);
+      mix   = (uint8_t)((uint32_t)255 * tri / half);
+      scale = (uint8_t)(110 + (uint32_t)145 * tri / half);
+      break;
+    }
+    case FX_FLOW: {                          // 双色渐变流动：颜色连续来回变化
+      uint32_t tri = (phase < half) ? phase : (period - phase);
+      mix   = (uint8_t)((uint32_t)255 * tri / half);
+      scale = 255;
+      break;
+    }
+    default: break;                          // FX_SOLID 常亮
   }
-  // v1.4.1：状态引擎下的独立亮度调节（NVS 持久化，开机保留）
-  v = (uint8_t)((uint32_t)v * g_statusBrightness / 255);
-  RgbColor c = hsvToRgb(h, sat, v);
-  showRgb(c.r, c.g, c.b);
+
+  uint8_t r = mixRgb(f.r1, f.r2, mix);
+  uint8_t g = mixRgb(f.g1, f.g2, mix);
+  uint8_t b = mixRgb(f.b1, f.b2, mix);
+  // 三级亮度叠加：动效明暗 × 该状态配置亮度 × 全局状态灯亮度
+  uint32_t k = (uint32_t)scale * f.level * g_statusBrightness / (255 * 100);
+  showRgb((uint8_t)((uint32_t)r * k / 255),
+          (uint8_t)((uint32_t)g * k / 255),
+          (uint8_t)((uint32_t)b * k / 255));
 }
 
 String getStatusJson() {

@@ -39,8 +39,8 @@ DEFAULT_CONFIG: dict = {
     "min_dwell_ms": 300,
     "done_hold_ms": 10000,          # 完成绿色常亮 10s 后回 idle
     "idle_after_ms": 600000,        # 非工作态长时间无事件回 idle
-    "stalled_after_ms": 180000,     # 工作中卡住 3 分钟 -> error 红色快闪；0 = 关闭
-    "error_hold_ms": 3000,          # 红闪至少显示 3s，之后可由工作事件自动恢复
+    "stalled_after_ms": 0,          # 默认关闭：IDE 事件不全，用时间猜「卡住」会误报
+    "error_hold_ms": 3000,          # 工具失败红闪的最短显示时长，到期自动消退
     "infer_outputting": False,      # 无「流式输出」事件，默认不靠静默猜测
     "outputting_after_ms": 3500,
     "lock_human": True,             # 等待态建立后不允许普通事件覆盖
@@ -449,6 +449,12 @@ def cmd_selftest(args) -> int:
         ({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, "thinking"),
         ({"hook_event_name": "PostToolUse", "tool_name": "Bash",
           "tool_response": {"success": False}}, "error"),
+        ({"hook_event_name": "PostToolUse", "tool_name": "Read",
+          "tool_response": "Error calling tool: Could not find file 'x'."}, "error"),
+        ({"hook_event_name": "PostToolUse", "tool_name": "Read",
+          "tool_response": "Error calling tool: permission denied"}, "error"),
+        ({"hook_event_name": "PostToolUse", "tool_name": "Read",
+          "tool_response": "Contents of x. error handling notes."}, "thinking"),
         ({"hook_event_name": "Notification",
           "notification_type": "permission_prompt"}, "need_confirm"),
         ({"hook_event_name": "Notification",
@@ -467,8 +473,9 @@ def cmd_selftest(args) -> int:
           "工具完成回到思考（紫色呼吸）")
     check(map_hook({"hook_event_name": "PostToolUse"}).release_sticky is True,
           "PostToolUse 是等待态的解除信号")
-    check(map_hook({"hook_event_name": "Stop"}).state == "done",
-          "Stop 只上报完成，不猜测等人")
+    stop_ev = map_hook({"hook_event_name": "Stop"})
+    check(stop_ev.state == "done" and stop_ev.release_sticky is True,
+          "Stop 上报完成并解除等待态")
     check(map_hook({"hook_event_name": "UserPromptSubmit"}).release_sticky is True,
           "UserPromptSubmit 代表用户已回复")
 
@@ -498,26 +505,36 @@ def cmd_selftest(args) -> int:
         base.update(kw)
         return StateMachine(**base)
 
-    # 1) 明确的授权请求 -> need_confirm，且不可被普通状态覆盖
+    # 1) 授权请求 -> need_confirm；无关通知不覆盖，用户处理完立即解除
     machine = new_machine()
     machine.update(map_hook({"hook_event_name": "Notification",
                              "notification_type": "permission_prompt", "session_id": "s1"}))
     check(machine.current == "need_confirm", "授权请求转 need_confirm")
-    for payload, label in [
-        ({"hook_event_name": "Stop", "session_id": "s1"}, "done"),
-        ({"hook_event_name": "PreToolUse", "tool_name": "write_to_file",
-          "session_id": "s1"}, "coding"),
-        ({"hook_event_name": "PostToolUse", "tool_name": "Bash",
-          "tool_response": {"success": False}, "session_id": "s1"}, "工具报错"),
-        ({"hook_event_name": "StopFailure", "session_id": "s1"}, "任务失败"),
-    ]:
-        machine.update(map_hook(payload))
-        check(machine.current == "need_confirm", f"{label} 不能覆盖等待态")
+    machine.update(map_hook({"hook_event_name": "PreCompact", "session_id": "s1"}))
+    check(machine.current == "need_confirm", "无关通知不覆盖等待态")
     check(machine.snapshot()["waiting_for_human"] is True, "等待态被标记")
 
-    tr = machine.update(map_hook({"hook_event_name": "UserPromptSubmit",
-                                  "session_id": "s1", "prompt": "继续"}))
-    check(machine.current == "thinking" and bool(tr) and tr[0].force,
+    tr = machine.update(map_hook({"hook_event_name": "PreToolUse",
+                                  "tool_name": "read_file", "session_id": "s1"}))
+    check(machine.current == "searching" and machine.sticky is None,
+          "确认后新的 PreToolUse 立即解除等待态（不再一直橙闪）")
+    check(bool(tr) and tr[0].force, "解除时 force 覆盖设备端高优先级")
+
+    # 1b) Stop 结束本轮也必须解除等待态
+    stop_m = new_machine()
+    stop_m.update(map_hook({"hook_event_name": "PermissionRequest", "session_id": "s9"}))
+    check(stop_m.current == "need_confirm", "PermissionRequest -> need_confirm")
+    stop_m.update(map_hook({"hook_event_name": "Stop", "session_id": "s9"}))
+    check(stop_m.current == "done" and stop_m.sticky is None,
+          "Stop 结束本轮时解除等待态并进入完成")
+
+    # 1c) 用户新需求解除
+    rel = new_machine()
+    rel.update(map_hook({"hook_event_name": "Elicitation", "session_id": "s8"}))
+    check(rel.current == "need_input", "Elicitation -> need_input")
+    tr = rel.update(map_hook({"hook_event_name": "UserPromptSubmit",
+                              "session_id": "s8", "prompt": "继续"}))
+    check(rel.current == "thinking" and bool(tr) and tr[0].force,
           "用户回复解除粘性并 force 覆盖设备优先级")
 
     # 2) 核心回归：深度思考 / 长时间静默绝不误报「需要人处理」
@@ -562,6 +579,37 @@ def cmd_selftest(args) -> int:
     stalled.update(map_hook({"hook_event_name": "UserPromptSubmit", "prompt": "重试"}))
     check(stalled.sticky is None and stalled.current == "thinking",
           "用户新需求立即解除卡住红闪")
+
+    # 5b) IDE 实测的真实失败格式（纯字符串）必须立刻红闪
+    fail_m = new_machine()
+    fail_m.update(map_hook({"hook_event_name": "PostToolUse", "tool_name": "Read",
+                            "session_id": "f1",
+                            "tool_response": "Error calling tool: Could not find file 'x'."}))
+    check(fail_m.current == "error" and fail_m.sticky[0] == "error",
+          "真实失败字符串 -> error 红闪（v1.3.0 完全识别不到）")
+    fail_m.update(map_hook({"hook_event_name": "PreToolUse", "tool_name": "Grep",
+                            "session_id": "f1"}))
+    check(fail_m.current == "searching" and fail_m.sticky is None,
+          "失败后 AI 继续工作，error 立即解除")
+
+    # 5c) 没有后续事件时红闪到期自动消退，不会永久红灯
+    fade_m = new_machine(error_hold_ms=1000)
+    fade_m.update(map_hook({"hook_event_name": "PostToolUse", "tool_name": "Read",
+                            "session_id": "f2",
+                            "tool_response": "Error calling tool: boom"}))
+    check(fade_m.current == "error", "失败 -> error")
+    check(not fade_m.tick(time.monotonic() + 0.5), "红闪至少保持 error_hold_ms")
+    tr = fade_m.tick(time.monotonic() + 1.5)
+    check(bool(tr) and fade_m.sticky is None and fade_m.current != "error",
+          "红闪到期自动消退，不会永久红灯")
+
+    # 5d) 文件内容里含 error 字样不能误判成失败
+    ok_m = new_machine()
+    ok_m.update(map_hook({"hook_event_name": "PostToolUse", "tool_name": "Read",
+                          "session_id": "f3",
+                          "tool_response": "Contents: try/except error handling"}))
+    check(ok_m.current == "thinking",
+          "内容含 error 字样不误报（只认 Error calling tool 前缀）")
 
     # 6) 需要人处理的三种快闪都只由明确信号触发
     for payload, expected in [
@@ -651,6 +699,20 @@ def cmd_selftest(args) -> int:
         _post(base + "/event", {"hook_event_name": "PostToolUse", "session_id": "wait"})
         check(_get(base + "/health")["state"]["state"] == "thinking",
               "端到端：工具完成回到思考（紫色呼吸）")
+
+        # 真实失败格式（IDE 实测是纯字符串）必须立即红闪
+        _post(base + "/event", {"hook_event_name": "PostToolUse", "session_id": "fail",
+                                "tool_name": "Read",
+                                "tool_response": "Error calling tool: Could not find file 'x'."})
+        health = _get(base + "/health")
+        check(health["state"]["state"] == "error", "端到端：真实失败立即打出 error")
+        check(health["device"]["last_frame"].get("state") == "error",
+              "端到端：设备最后一帧为 error 红闪")
+        _post(base + "/event", {"hook_event_name": "PreToolUse", "session_id": "fail",
+                                "tool_name": "Grep"})
+        check(_get(base + "/health")["state"]["state"] == "searching",
+              "端到端：失败后继续工作，error 立即解除")
+        _post(base + "/clear", {})
 
         # 完成态：Stop -> done（TTL 10s）-> 到期 force 回 idle
         _post(base + "/event", {"hook_event_name": "Stop", "session_id": "wait"})

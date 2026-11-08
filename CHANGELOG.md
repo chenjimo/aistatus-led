@@ -4,7 +4,20 @@
 
 ## PC 端中间件
 
-### v1.3.0（2026-11-08，当前发布版）
+### v1.3.1（2026-11-08，当前发布版）
+
+修复「失败报不出来」和「处理完了灯不消」两个真实问题，全部基于实测取证。
+
+- **失败识别（根因）**：CodeBuddy IDE 的 `PostToolUse.tool_response` 是**纯字符串**，失败时形如 `Error calling tool: Could not find file 'x'.`，而 v1.3.0 只处理 dict，导致工具失败**从未上报过 `error`**。现在认 `Error calling tool:` / `tool execution failed` / `command failed` / `permission denied` 等前缀，并兼容 dict 的 `success:false` / `isError` / `exitCode≠0`。只认前缀，文件内容里出现 `error` 字样不误报。
+- **红闪不卡死**：`error` 立即以 `force=1` 推送，保持 `error_hold_ms`（3s）后若没有新事件就自动消退回工作态；AI 继续干活则立即解除。`stalled_timeout` 的 error 仍保持到有人处理。
+- **解除不及时（根因）**：IDE 实测 `UserPromptSubmit` 经常不发、`PostToolUse` 也缺（某次 25 vs 18）。现在 `need_confirm` / `need_input` 一旦 AI 重新开始调工具（任意 `PreToolUse`）或本轮结束（`Stop`）就立即解除，不再依赖不一定存在的事件。
+- **`stalled_after_ms` 默认改 0（关闭）**：它只能按「多久没事件」猜卡住，而 IDE 对 `execute_command` 根本不发 Hooks，长命令必然被误判成红闪。需要兜底时设 `300000`。
+- **Hooks 补强事件真正落到配置**：`install-hooks --write --scope user` 会把 `Notification` / `PermissionRequest` / `PermissionDenied` / `PostToolUseFailure` / `Elicitation` 写进 `settings.json`（此前只有 7 个事件，确认框通道根本没开）。
+- `/events` 增加 `tool` / `tool_response` / `keys` 字段，便于核对是「没发事件」还是「发了没认出来」。
+- 自检扩充到 88 项，新增真实失败格式、内容含 error 不误报、红闪自动消退、`need_confirm` 被 `PreToolUse` 解除、`Stop` 解除等待态等回归用例。
+- 固件同步为 **v1.5.0 灯效可配置版**（`done` 绿色慢闪 10s、每状态 RGB / 效果 / 亮度 / 周期可配 + `/api/fx`），仓库副本已脱敏。
+
+### v1.3.0（2026-11-08）
 
 **回退 v1.2.0 的静默推断，改为零猜测的状态分类**。v1.2.0 把「深度思考时长时间无事件」误判成 `need_input` / `need_confirm`，实际使用比 v1.1.0 更糟。
 
@@ -60,7 +73,8 @@
 
 | 版本 | 日期 | 主要内容 |
 | --- | --- | --- |
-| **v1.5.0 修复版** | 2026-11-08 | 按 `src` 为每个来源独立维护状态/seq/优先级/TTL/超时；可勾选绑定白名单（NVS 持久化）；网页「来源与绑定」卡片；mDNS + UDP 4210 广播发现；修复 WS 队列洪泛与 UDP 广播地址解析 |
+| **v1.5.0 灯效可配置版** | 2026-11-08 | 默认灯效重做（工作态偏暗、交互态偏亮）；新增双色渐变呼吸 `FX_GRADIENT`；每个状态的主色/辅色/效果/亮度/周期可在网页配置并写入 NVS（`GET|POST /api/fx`）；网页卡片可拖动排序（localStorage 记忆，页头可重置）、灯效配置默认折叠；协议与 `fw` 版本号不变 |
+| v1.5.0 修复版 | 2026-11-08 | 按 `src` 为每个来源独立维护状态/seq/优先级/TTL/超时；可勾选绑定白名单（NVS 持久化）；网页「来源与绑定」卡片；mDNS + UDP 4210 广播发现；修复 WS 队列洪泛与 UDP 广播地址解析 |
 | v1.5.0 | 2026-11-07 | 多来源与绑定初版、mDNS、UDP 发现 |
 | v1.4.1 | 2026-11-07 | 状态灯亮度独立可调（`status_brightness`），NVS 持久化 |
 | v1.4.0 | 2026-11-06 | AI 状态灯引擎、10 个状态、三通道统一承载、`/api/hello`、`/api/status`、CORS、`reqId` |

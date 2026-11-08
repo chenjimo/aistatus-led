@@ -1,12 +1,12 @@
 # ESP32-S3 端
 
-本目录是设备端发布内容，对应固件 **v1.5.0（修复版）**、协议 `ai-status/1`。
+本目录是设备端发布内容，对应固件 **v1.5.0 灯效可配置版**（`done` 绿色慢闪 10s、每个状态的主色/辅色/效果/亮度/周期都可在网页改并写入 NVS、`GET|POST /api/fx`）、协议 `ai-status/1`。
 
 ```
 esp32/
 ├── README.md                    ← 本文件
 └── firmware/
-    └── ESP-S3-Demo1.ino         ← 可编译的完整固件源码（v1.5.0）
+    └── ESP-S3-Demo1.ino         ← 可编译的完整固件源码（v1.5.0 灯效可配置版）
 ```
 
 也可直接下载 `packages/aistatus-led-esp32-v1.5.0.zip`。

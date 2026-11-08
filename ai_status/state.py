@@ -39,8 +39,8 @@ class StateMachine:
     min_dwell_ms: int = 300
     done_hold_ms: int = 10000        # done 绿色常亮 10s 后回 idle
     idle_after_ms: int = 600000      # 非工作态长时间无事件回 idle
-    stalled_after_ms: int = 180000   # 工作中卡住 3 分钟 -> error 红色快闪；0 = 关闭
-    error_hold_ms: int = 3000        # 红闪至少显示这么久，之后可由工作事件自动恢复
+    stalled_after_ms: int = 0        # 默认关闭：IDE 事件不全，用时间猜「卡住」必然误报
+    error_hold_ms: int = 3000        # 工具失败红闪的最短显示时长，到期自动消退回工作态
     infer_outputting: bool = False   # 默认关闭：无「流式输出」事件，不靠静默猜
     outputting_after_ms: int = 3500
     lock_human: bool = True          # 等待态建立后，普通事件不得覆盖
@@ -126,10 +126,12 @@ class StateMachine:
         # ③ error 红闪显示够 error_hold_ms 后，AI 恢复工作即可自动清除
         error_recovered = (
             self.sticky is not None and self.sticky[0] == "error"
-            and ev.state is not None and not is_sticky(ev.state)
-            and now - self.last_change >= self.error_hold_ms / 1000)
+            and ev.state is not None and not is_sticky(ev.state))
+        # 等待态：AI 重新开始调用工具 = 用户已经处理完。IDE 实测 UserPromptSubmit
+        # 经常不发，PreToolUse 才是「已放行」最可靠的信号，need_confirm 也必须认它，
+        # 否则确认完灯会一直橙闪不消。
         input_resolved = (
-            self.sticky is not None and self.sticky[0] == "need_input"
+            self.sticky is not None and self.sticky[0] in HUMAN_STATES
             and ev.state in WORK_STATES)
         release = ev.release_sticky or error_recovered or input_resolved
         locked = self._human_locked(ev, release)
@@ -168,6 +170,21 @@ class StateMachine:
             self.current, self.current_msg, self.current_reason = tr.state, tr.msg, tr.reason
             self.last_change = now
             return [tr]
+
+        # 工具失败的红闪：没有后续事件时，error_hold_ms 后自动消退回工作态，
+        # 避免「处理完了红灯还一直亮」。stalled_timeout 需要人关注，保持不动。
+        if self.sticky and self.sticky[0] == "error":
+            if self.current_reason == "stalled_timeout":
+                return []
+            if now - self.last_change >= self.error_hold_ms / 1000:
+                self.sticky = None
+                # sessions 里也存着 error，不清掉的话 _resolve 会把它原样取回来
+                for item in self.sessions.values():
+                    if item.state == "error":
+                        item.state = "thinking"
+                target, msg, _ = self._resolve(now)
+                return self._transition(target, msg, "error_fade", True, now)
+            return []
 
         if self.sticky:
             return []

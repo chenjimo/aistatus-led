@@ -14,17 +14,19 @@
 
 | 状态 | 含义 | 灯效 |
 | --- | --- | --- |
-| `idle` | 空闲待命 | 暗蓝常亮 |
-| `thinking` | 思考中 / 收到需求 | 紫色慢呼吸 |
-| `searching` | 找资料 / 检索 / 读文件 | 黄色慢闪 |
-| `coding` | 写脚本 / 改文件 / 执行命令 | 蓝青快呼吸 |
-| `outputting` | 输出回答中 | 渐变流动 |
-| `done` | 本轮完成 | 绿色常亮，10 秒后回 `idle` |
-| `need_input` | 需要你补充信息 | 粉白双闪（粘性快闪） |
+| `idle` | 空闲待命 | 暗蓝常亮（工作态整体偏暗） |
+| `thinking` | 思考中 / 收到需求 | 深紫慢渐变呼吸 3s |
+| `searching` | 找资料 / 检索 / 读文件 | 绿→黄渐变呼吸 1.8s |
+| `coding` | 写脚本 / 改文件 / 执行命令 | 青蓝呼吸 1.2s |
+| `outputting` | 输出回答中 | 青色渐变流动 3s |
+| `done` | 本轮完成 | 绿色慢闪，10 秒后回 `idle` |
+| `need_input` | 需要你补充信息 | 粉色快闪（粘性） |
 | `need_confirm` | 需要你确认 / 授权 | 橙色快闪（粘性） |
-| `error` | 工具失败 / 处理时间过长 | 红色急闪（粘性） |
+| `error` | 工具失败（IDE 实测 `Error calling tool:`）/ 可选超时兜底 | 红色急闪，约 3s 后自动消退 |
 
-**v1.3.0 起状态只认真实事件，不做静默猜测**：深度思考（长时间无事件）稳定显示紫色呼吸，不会再被误判成「需要人处理」。等待态只由明确的确认 / 提问 / 失败信号触发；真卡住超过 3 分钟归为红色 `error`。代价是 IDE 版实测不发确认 / 提问事件，这两个灯在 IDE 下基本不会自动亮——宁可不亮，也不乱亮，详见 `docs/02` 第七节。
+**灯效可以自己改**：设备网页「AI 状态灯」卡片里的「灯效配置」默认折叠，展开后每个状态都能单独改主色 / 辅色 / 效果 / 亮度 / 周期，保存写入 NVS，重启保留。网页卡片标题还能拖动排序，顺序记在浏览器本地。整体原则是**工作态偏暗、需要你处理时明显更亮**。
+
+**v1.3.1 起状态只认真实事件，不做静默猜测**：深度思考（长时间无事件）稳定显示紫色呼吸，不会再被误判成「需要人处理」。工具真实失败（IDE 返回 `Error calling tool: ...`）会立即红闪，约 3s 自动消退；等待态在你放行 / 本轮结束后立即解除，不会一直亮着。代价是 IDE 版实测对 `execute_command` 根本不发 Hooks、确认框也拿不到事件，这两个灯在 IDE 下基本不会自动亮——宁可不亮，也不乱亮，详见 `docs/02` 第七节。
 
 等待态仍是**最高优先级**：一旦亮起，`coding`、`done`、工具报错等任何状态都盖不掉，只有你回复、点了确认（工具继续执行）、会话结束或 `python main.py clear` 才会解除。其余粘性状态不会被超时冲掉；PC 停止心跳 15 秒后设备自动转 `offline`（极暗蓝）。
 
@@ -34,8 +36,8 @@
 
 | 组件 | 版本 | 位置 |
 | --- | --- | --- |
-| **PC 端中间件** | **v1.3.0** | `main.py` + `ai_status/` |
-| **ESP32-S3 固件** | **v1.5.0（修复版）** | `esp32/firmware/ESP-S3-Demo1.ino` |
+| **PC 端中间件** | **v1.3.1** | `main.py` + `ai_status/` |
+| **ESP32-S3 固件** | **v1.5.0（灯效可配置版）** | `esp32/firmware/ESP-S3-Demo1.ino`（仓库副本待同步） |
 | 通信协议 | `ai-status/1` v1.0.0（+ 可选 `src`） | `docs/04-协议与来源ID绑定.md` |
 | Python | 3.10+（实测 3.10.6） | 需加入 PATH |
 | 操作系统 | Windows（串口直连）；局域网模式见下方限制 | — |
@@ -70,7 +72,8 @@ aistatus-led/
 │   └── firmware/
 │       └── ESP-S3-Demo1.ino     ← v1.5.0 固件源码（WiFi 已脱敏为占位符）
 └── packages/
-    ├── aistatus-led-pc-v1.3.0.zip      ← PC 端当前发布包
+    ├── aistatus-led-pc-v1.3.1.zip      ← PC 端当前发布包
+    ├── aistatus-led-pc-v1.3.0.zip      ← 历史包（失败识别缺失，建议升级）
     ├── aistatus-led-pc-v1.2.0.zip      ← 历史包（静默推断版，误报多，勿用）
     ├── aistatus-led-pc-v1.1.0.zip      ← 历史包
     └── aistatus-led-esp32-v1.5.0.zip   ← 设备端独立发布包
@@ -113,7 +116,7 @@ python main.py clear          # 看完后解除
 
 服务窗口不要关；关掉后设备 15 秒无心跳会自动转 `offline`。
 
-> **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（74 项，不需要硬件）确认升级无误。**v1.2.0 用户请务必升级**：该版会把深度思考误报成等待态。
+> **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（88 项，不需要硬件）确认升级无误。**v1.2.0 用户请务必升级**：该版会把深度思考误报成等待态。
 
 > **不想每次手动开服务**：跑一次 `powershell -ExecutionPolicy Bypass -File .\tools\codebuddy-autostart.ps1 -Install`，之后每次登录并打开 CodeBuddy 会自动拉起服务（免管理员、幂等、可卸载）。详见 `docs/01` 第 10 节。
 
@@ -155,7 +158,7 @@ python main.py clear          # 看完后解除
 - 串口直连实现是 **Windows 专用**（Win32 API + PowerShell 枚举串口）；Mac/Linux 需安装 `pyserial` 并小改串口枚举，纯局域网模式可设 `prefer_serial: false`。
 - 广播、mDNS、`/24` 扫描都**过不了路由器**：PC 与设备必须在同一网段；跨网段时只剩 USB 串口直连可用。
 - `outputting` 没有对应的 Hook 事件，默认**不做**推断（`infer_outputting: false`）；需要时在 Hook 载荷里带 `ai_status_state: "outputting"` 显式上报。
-- **IDE 版确认框 / 提问框不发任何 Hooks 事件**，`tool_name` 经常为空，`PostToolUse` 也经常缺失。所以 PC 端**不猜测**「等人」：`need_input` / `need_confirm` 只由明确信号触发，在 IDE 下基本不会自动亮。工作中卡住超过 3 分钟会归为 `error` 红色快闪（`stalled_after_ms` 可调或设 `0` 关闭）。
+- **IDE 版确认框 / 提问框不发任何 Hooks 事件**（实测 `execute_command` 连 `PreToolUse` 都不发），`tool_name` 经常为空，`PostToolUse` 也经常缺失。所以 PC 端**不猜测**「等人」：`need_input` / `need_confirm` 只由明确信号触发，在 IDE 下基本不会自动亮。真正的失败由 `Error calling tool:` 精确识别，红闪 3s 自动消退；`stalled_after_ms` 默认关闭（时间猜卡住必然误报），需要兜底可设 `300000`。
 - `Notification` / `PermissionRequest` / `PermissionDenied` / `PostToolUseFailure` / `Elicitation` 等补强事件已默认注册：IDE 不发时无副作用，一旦发出即精确命中；CLI 用户仍可用 `--with-cli` 补齐其余事件。
 - 灯效的颜色与动效（如「黄色呼吸」「绿色慢闪」）由固件 `STATUS_DEFS` 决定，只改 PC 端改不了；PC 端能改的是状态判定与 `ttl` 时长。
 - 设备端 UDP 4210 广播发现需要 PC 防火墙放行入站规则（需管理员操作）；不改防火墙时优先用 mDNS `esp32s3-ai.local`，PC 端已支持。
