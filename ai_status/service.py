@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -16,6 +18,36 @@ from . import __version__
 from .device import DeviceLink
 from .mapper import map_hook
 from .state import StateMachine, Transition
+
+# 客户端提前断开（探活超时、浏览器刷新/关闭、脚本取消）在 Windows 上表现为
+# ConnectionAbortedError / ConnectionResetError / BrokenPipeError。它们不是服务端
+# 错误，只是客户端已走，写响应必然失败。默认 ThreadingHTTPServer 会把 traceback
+# 打到 stderr，造成大量噪音；这里统一静默。
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """端口是否已有进程在监听（用于单实例保护）。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False   # Windows 上 True 会让多实例绑定同一端口
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, _CLIENT_GONE):
+            return
+        super().handle_error(request, client_address)
 
 
 class StatusService:
@@ -93,8 +125,17 @@ class StatusService:
     def _start_http(self) -> None:
         host = str(self.cfg.get("listen_host", "127.0.0.1"))
         port = int(self.cfg.get("listen_port", 8765))
+        # 单实例保护：端口已被占用说明已有服务在跑，直接退出。否则 Windows 的
+        # SO_REUSEADDR 会让多个实例同时绑定 8765，互相抢连接、把 /health 拖到超时。
+        if _port_in_use(host, port):
+            self.log.error("端口 %d 已被占用：检测到已有服务在运行，本实例退出。", port)
+            raise SystemExit(0)
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer((host, port), handler)
+        try:
+            self._httpd = QuietThreadingHTTPServer((host, port), handler)
+        except OSError as exc:
+            self.log.error("绑定端口 %d 失败（可能已有实例）：%s", port, exc)
+            raise SystemExit(0)
         self._httpd.daemon_threads = True
         self._server_thread = threading.Thread(
             target=self._httpd.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
@@ -112,26 +153,39 @@ class StatusService:
         heartbeat_s = float(self.cfg.get("heartbeat_ms", 5000)) / 1000
 
         while not self._stop.wait(0.1):
-            with self.lock:
-                now = time.monotonic()
-                transitions = self.machine.tick(now)
-                if transitions:
-                    self._apply(transitions)
-                if self.link.connected and now - self.last_heartbeat >= heartbeat_s:
-                    reply = self.link.heartbeat(self.machine.current)
-                    self.last_heartbeat = now
-                    self.log.debug("心跳 %s seq=%d %s", self.machine.current,
-                                   self.link.seq, P_reply(reply))
-                if not self.link.connected and now >= self.reconnect_at:
-                    self.log.info("尝试重新发现设备（退避 %ss）…", self.backoff)
-                    if self.link.connect(simulate=bool(self.cfg.get("simulate", False))):
-                        self.backoff = 1.0
-                        self._apply([Transition(self.machine.current,
-                                                "重连后补发当前状态", "reconnect", True, None)])
-                    else:
-                        self.backoff = min(self.backoff * 2, 8)
-                        self.reconnect_at = now + self.backoff
+            try:
+                self._tick_once(heartbeat_s)
+            except Exception as exc:  # 主循环不能因单次异常退出
+                self.log.warning("主循环异常：%s", exc)
         self.shutdown()
+
+    def _tick_once(self, heartbeat_s: float) -> None:
+        # 1) 状态机 tick + 心跳：只在锁内做「快」操作
+        with self.lock:
+            now = time.monotonic()
+            transitions = self.machine.tick(now)
+            if transitions:
+                self._apply(transitions)
+            if self.link.connected and now - self.last_heartbeat >= heartbeat_s:
+                reply = self.link.heartbeat(self.machine.current)
+                self.last_heartbeat = now
+                self.log.debug("心跳 %s seq=%d %s", self.machine.current,
+                               self.link.seq, P_reply(reply))
+            need_reconnect = (not self.link.connected and now >= self.reconnect_at)
+        if not need_reconnect:
+            return
+        # 2) 设备发现可能要几十秒（串口扫描 / LAN 扫描 / mDNS）。必须放在锁外，
+        #    否则 /health 的请求线程会一直拿不到锁而超时。
+        self.log.info("尝试重新发现设备（退避 %ss）…", self.backoff)
+        ok = self.link.connect(simulate=bool(self.cfg.get("simulate", False)))
+        with self.lock:
+            if ok:
+                self.backoff = 1.0
+                self._apply([Transition(self.machine.current,
+                                        "重连后补发当前状态", "reconnect", True, None)])
+            else:
+                self.backoff = min(self.backoff * 2, 8)
+                self.reconnect_at = time.monotonic() + self.backoff
 
     def stop(self) -> None:
         self._stop.set()
@@ -150,34 +204,35 @@ class StatusService:
     # ---------- 查询 ----------
 
     def health(self) -> dict:
-        with self.lock:
-            return {
-                "ok": True,
-                "version": __version__,
-                "proto": "ai-status/1",
-                "source_id": self.link.source_id,
-                "source_field": self.link.source_field,
-                "tag_source_in_msg": self.link.tag_source,
-                "uptime_sec": int(time.monotonic() - self.started),
-                "state": self.machine.snapshot(),
-                "device": {
-                    "kind": self.link.kind,
-                    "connected": self.link.connected,
-                    "port": self.link.port.port if self.link.port else None,
-                    "ip": self.link.ip,
-                    "seq": self.link.seq,
-                    "info": self.link.info,
-                    "last_error": self.link.last_error,
-                    "last_frame": self.link.last_frame,
-                },
-                "last_push_ms": int((time.monotonic() - self.last_push) * 1000)
-                if self.last_push else None,
-                "event_count": len(self.events),
-            }
+        # 诊断端点不持全局锁：设备推送可能耗时，health 必须始终秒回。
+        # 读的是弱一致快照，用于诊断足够，也不阻塞 AI 主流程。
+        return {
+            "ok": True,
+            "version": __version__,
+            "proto": "ai-status/1",
+            "source_id": self.link.source_id,
+            "source_field": self.link.source_field,
+            "tag_source_in_msg": self.link.tag_source,
+            "uptime_sec": int(time.monotonic() - self.started),
+            "state": self.machine.snapshot(),
+            "device": {
+                "kind": self.link.kind,
+                "connected": self.link.connected,
+                "port": self.link.port.port if self.link.port else None,
+                "ip": self.link.ip,
+                "seq": self.link.seq,
+                "info": self.link.info,
+                "last_error": self.link.last_error,
+                "last_frame": self.link.last_frame,
+            },
+            "last_push_ms": int((time.monotonic() - self.last_push) * 1000)
+            if self.last_push else None,
+            "event_count": len(self.events),
+        }
 
     def recent_events(self, limit: int = 50) -> list[dict]:
-        with self.lock:
-            return list(self.events)[-limit:]
+        # 不持锁：deque.append 与 list() 在当前用法下安全
+        return list(self.events)[-limit:]
 
 
 def P_reply(reply: dict) -> str:
@@ -197,14 +252,18 @@ def _make_handler(service: StatusService):
 
         def _json(self, code: int, obj) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.end_headers()
+                self.wfile.write(body)
+            except _CLIENT_GONE:
+                # 客户端已断开：写不出去是正常的，不是服务端错误
+                pass
 
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)

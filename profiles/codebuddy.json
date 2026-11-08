@@ -1,0 +1,51 @@
+{
+  "name": "codebuddy",
+  "label": "CodeBuddy IDE / CLI",
+  "detect": {
+    "tools": ["Grep", "Read", "write_to_file", "replace_in_file", "execute_command", "search_content"]
+  },
+  "events": {
+    "SessionStart": "session_start",
+    "SessionEnd": "session_end",
+    "UserPromptSubmit": "prompt",
+    "PreToolUse": "pre_tool",
+    "PostToolUse": "post_tool",
+    "PostToolUseFailure": "failure_event",
+    "PermissionRequest": "need_confirm",
+    "PermissionPrompt": "need_confirm",
+    "ToolPermissionRequest": "need_confirm",
+    "PermissionDenied": "failure_event",
+    "StopFailure": "failure_event",
+    "TaskFailed": "failure_event",
+    "Stop": "done",
+    "Notification": "notification",
+    "Elicitation": "need_input",
+    "ElicitationDialog": "need_input",
+    "AskUser": "need_input",
+    "PreCompact": "noop",
+    "PostCompact": "noop",
+    "SubagentStart": "noop",
+    "SubagentStop": "noop",
+    "TaskCreated": "noop",
+    "TaskCompleted": "noop",
+    "InstructionsLoaded": "noop",
+    "ConfigChange": "noop",
+    "ElicitationResult": "noop",
+    "TeammateIdle": "noop",
+    "FileChanged": "noop",
+    "CwdChanged": "noop",
+    "WorktreeCreate": "noop",
+    "WorktreeRemove": "noop",
+    "Setup": "noop"
+  },
+  "search_tools": ["web_search", "WebSearch", "web_fetch", "WebFetch", "RAG_search", "search_content", "Grep", "search_file", "list_dir", "Glob", "read_file", "Read", "codebase_search", "Task", "task"],
+  "code_tools": ["write_to_file", "Write", "replace_in_file", "Edit", "MultiEdit", "NotebookWrite", "delete_file", "execute_command", "Bash", "apply_patch", "create_file", "install_binary"],
+  "input_tools": ["ask_followup_question", "AskUserQuestion", "AskUser", "ask_user", "askUser", "prompt_user", "Elicitation"],
+  "failure_prefixes": ["error calling tool", "tool execution failed", "command failed", "command exited with code", "failed to execute", "permission denied", "operation cancelled", "operation canceled", "request interrupted"],
+  "notification": {
+    "permission_prompt": "need_confirm",
+    "idle_prompt": "need_input",
+    "elicitation_dialog": "need_input"
+  },
+  "command_search_patterns": []
+}

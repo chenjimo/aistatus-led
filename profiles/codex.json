@@ -1,0 +1,42 @@
+{
+  "name": "codex",
+  "label": "OpenAI Codex CLI",
+  "detect": {
+    "tools": ["apply_patch", "Bash", "shell"]
+  },
+  "events": {
+    "SessionStart": "session_start",
+    "SessionEnd": "session_end",
+    "UserPromptSubmit": "prompt",
+    "PreModelRequest": "model_start",
+    "PostModelRequest": "model_complete",
+    "PreToolUse": "pre_tool",
+    "PostToolUse": "post_tool",
+    "PostToolUseFailure": "failure_event",
+    "PermissionRequest": "need_confirm",
+    "PermissionPrompt": "need_confirm",
+    "PermissionDenied": "failure_event",
+    "StopFailure": "failure_event",
+    "Stop": "done",
+    "Interrupt": "interrupted",
+    "Notification": "notification",
+    "PreModelRequest": "model_start",
+    "PostModelRequest": "model_complete",
+    "Interrupt": "interrupted",
+    "Elicitation": "need_input",
+    "AskUser": "need_input",
+    "PreCompact": "noop",
+    "PostCompact": "noop",
+    "SubagentStart": "noop",
+    "SubagentStop": "noop"
+  },
+  "search_tools": ["web_search", "WebSearch", "web_fetch", "WebFetch", "read_file", "Read", "grep", "rg", "Glob", "list_dir", "search_file"],
+  "code_tools": ["apply_patch", "Bash", "shell", "write_file", "edit_file", "create_file"],
+  "input_tools": ["ask_user", "AskUser", "request_user_input"],
+  "failure_prefixes": ["error calling tool", "command failed", "command exited with code", "failed to execute", "permission denied", "exited with status", "non-zero exit", "exit code"],
+  "notification": {
+    "permission_prompt": "need_confirm",
+    "idle_prompt": "need_input"
+  },
+  "command_search_patterns": ["grep", "rg ", "rg\t", "find ", "cat ", "ls ", "head ", "tail ", "sed ", "awk ", "git log", "git diff", "git show"]
+}

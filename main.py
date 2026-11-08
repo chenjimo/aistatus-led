@@ -26,7 +26,7 @@ from pathlib import Path
 
 from ai_status import __version__, protocol as P
 from ai_status.device import find_lan, list_serial_candidates, probe_serial
-from ai_status.mapper import map_hook
+from ai_status.mapper import list_profiles, map_hook
 from ai_status.service import StatusService
 from ai_status.state import StateMachine
 
@@ -57,6 +57,15 @@ DEFAULT_CONFIG: dict = {
     "hello_timeout_ms": 350,
     "http_timeout_ms": 1500,
     "simulate": False,
+    # 手机桥接（HarmonyOS App）：随 start 一起启动，局域网 UDP 发现 + HTTP 服务
+    "phone_bridge_enabled": True,
+    "phone_bridge_port": 8770,
+    "phone_bridge_discovery_port": 4211,
+    "phone_bridge_pin": "123456",
+    "phone_bridge_pair_required": True,
+    "phone_bridge_enable_input": True,
+    "phone_bridge_firewall": True,
+    "phone_bridge_dir": str(APP_DIR / "tools" / "pc-bridge"),
     "source_id": "",                       # 留空则自动生成并持久化到 client_id.json
     "source_field": "src",                 # 帧里的来源字段名，可随固件约定调整
     "tag_source_in_msg": True,             # 把 [来源ID] 写进 msg，设备会原样广播
@@ -90,6 +99,26 @@ CLI_EXTRA_EVENTS = [
     ("SubagentStop", ""),
     ("Elicitation", ""),
     ("ElicitationResult", ""),
+]
+
+# OpenAI Codex（CLI / Desktop）的事件（~/.codex/hooks.json）。
+# 这些钩子均为观测用途，生成配置时会以 async 方式发送，绝不阻塞 agent。
+CODEX_EVENTS = [
+    ("SessionStart", None),
+    ("SessionEnd", "other"),
+    ("UserPromptSubmit", None),
+    ("PreModelRequest", None),
+    ("PostModelRequest", None),
+    ("PreToolUse", ".*"),
+    ("PostToolUse", ".*"),
+    ("PermissionRequest", ".*"),
+    ("Stop", None),
+    ("Interrupt", None),
+    ("Notification", ""),
+    ("PreCompact", ""),
+    ("PostCompact", ""),
+    ("SubagentStart", ""),
+    ("SubagentStop", ""),
 ]
 
 
@@ -172,18 +201,23 @@ def _get(url: str, timeout: float = 2.0) -> dict:
 
 # ---------------- Hook 配置生成 ----------------
 
-def _hook_command(event: str, port: int) -> str:
+def _hook_command(event: str, port: int, profile: str = "codebuddy") -> str:
     exe = sys.executable.replace("\\", "/")
     script = str(APP_DIR / "main.py").replace("\\", "/")
-    return f'"{exe}" "{script}" hook --event {event} --port {port}'
+    # codebuddy 是默认 profile，省略参数以兼容旧 settings.json 的去重逻辑
+    suffix = f" --profile {profile}" if profile and profile != "codebuddy" else ""
+    return f'"{exe}" "{script}" hook --event {event}{suffix} --port {port}'
 
 
-def _hooks_block(events, port: int) -> dict:
+def _hooks_block(events, port: int, profile: str, *, background: bool = False) -> dict:
     hooks = {}
     for event, matcher in events:
         group: dict = {"hooks": [{"type": "command",
-                                  "command": _hook_command(event, port),
+                                  "command": _hook_command(event, port, profile),
                                   "timeout": 5}]}
+        if background:
+            # 状态灯是旁路观测，不应把网络/串口抖动带入 Codex 的关键路径。
+            group["hooks"][0]["async"] = True
         if matcher is not None:
             group["matcher"] = matcher
         hooks[event] = [group]
@@ -195,12 +229,122 @@ def generate_hook_files(cfg: dict) -> dict[str, Path]:
     paths = {
         "ide": APP_DIR / "hooks.settings.ide.json",
         "cli": APP_DIR / "hooks.settings.cli.json",
+        "codex": APP_DIR / "hooks.codex.json",
     }
-    paths["ide"].write_text(json.dumps(_hooks_block(IDE_EVENTS, port),
+    paths["ide"].write_text(json.dumps(_hooks_block(IDE_EVENTS, port, "codebuddy"),
                                        ensure_ascii=False, indent=2), "utf-8")
-    paths["cli"].write_text(json.dumps(_hooks_block(CLI_EXTRA_EVENTS, port),
+    paths["cli"].write_text(json.dumps(_hooks_block(CLI_EXTRA_EVENTS, port, "codebuddy"),
                                        ensure_ascii=False, indent=2), "utf-8")
+    paths["codex"].write_text(json.dumps(_hooks_block(CODEX_EVENTS, port, "codex",
+                                                         background=True),
+                                         ensure_ascii=False, indent=2), "utf-8")
     return paths
+
+
+DSH_PLUGIN_JS = r'''// aistatus-led :: DeepSeek (DSH) 插件骨架
+// 把 DSH 事件总线上的真实事件转发到本地中间件 http://127.0.0.1:8765/event
+// 依赖：Node 18+（内置 fetch）。事件回调参数名以你所装 DSH 版本为准，必要时调整下面的取值。
+const PORT = process.env.AISTATUS_PORT || 8765
+const ENDPOINT = `http://127.0.0.1:${PORT}/event`
+
+function post(payload) {
+  const body = JSON.stringify({ _profile: 'dsh', ...payload })
+  try {
+    const p = fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    if (p && typeof p.catch === 'function') p.catch(() => {})
+  } catch (_) { /* 中间件未启动时静默跳过，绝不影响 AI 主流程 */ }
+}
+
+export const name = 'aistatus-led'
+
+export function apply(ctx) {
+  const on = (event, mapper) => {
+    try {
+      ctx.on(event, (...args) => {
+        try { post(mapper(...args)) } catch (_) {}
+      })
+    } catch (_) {}
+  }
+
+  on('session/created', () => ({ hook_event_name: 'session/created' }))
+  on('session/ended', () => ({ hook_event_name: 'session/ended' }))
+  on('agent/request', () => ({ hook_event_name: 'agent/request' }))
+
+  on('tools/pre-execute', (execution) => ({
+    hook_event_name: 'tools/pre-execute',
+    tool_name: execution?.tool?.name || execution?.name || execution?.toolName,
+    tool_input: execution?.args || execution?.input || execution?.toolInput || {},
+  }))
+  on('tools/post-execute', (execution, result) => ({
+    hook_event_name: 'tools/post-execute',
+    tool_name: execution?.tool?.name || execution?.name || execution?.toolName,
+    tool_response: result,
+  }))
+
+  on('approval/request', () => ({ hook_event_name: 'approval/request' }))
+  on('approval/denied', () => ({ hook_event_name: 'approval/denied' }))
+  on('turn/end', () => ({ hook_event_name: 'turn/end' }))
+}
+'''
+
+DSH_PLUGIN_PKG = r'''{
+  "name": "aistatus-led-dsh",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "description": "Forward DeepSeek (DSH) harness events to the AI status LED middleware"
+}
+'''
+
+DSH_PLUGIN_README = r'''# aistatus-led（DSH 插件）
+
+把 DeepSeek (DSH) 的事件总线转发到本机 AI 状态灯中间件，让 ESP32 灯在 DSH 下也能显示
+思考 / 找资料 / 编写 / 需要确认 / 完成 / 失败 等状态。
+
+## 原理
+
+- DSH 是 Cordis 插件架构，插件用 `ctx.on(event, handler)` 订阅真实事件；
+- 本插件订阅 `approval/request`、`tools/pre-execute`、`tools/post-execute`、
+  `session/created`、`agent/request`、`turn/end`，把事件 POST 到
+  `http://127.0.0.1:8765/event`（带 `_profile: dsh`）；
+- 中间件按 `profiles/dsh.json` 映射成状态帧，经串口 / WiFi 推给 ESP32。
+
+## 安装
+
+1. 先确保 PC 中间件在跑：`python main.py start`（或已安装自启动）；
+2. 把本目录装进 DSH（路径按你本机实际调整）：
+
+   ```bash
+   dsh plugin add <本目录绝对路径>
+   ```
+
+3. 若你的 DSH 版本事件参数不同，改 `index.mjs` 里 `on(...)` 的取值即可，事件名不用改。
+
+## 端口
+
+默认 8765。中间件换了端口时，设置环境变量 `AISTATUS_PORT`。
+'''
+
+def generate_dsh_plugin() -> Path:
+    """确保 DSH 插件目录存在。
+
+    tools/dsh-plugin/ 是已按 DSH 真实事件名校正过的正式插件，不能让
+    install-hooks 用内置模板把它覆盖回旧骨架；仅当文件缺失时才补建。
+    """
+    plugin_dir = APP_DIR / "tools" / "dsh-plugin"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    templates = {"index.mjs": DSH_PLUGIN_JS, "package.json": DSH_PLUGIN_PKG,
+                 "README.md": DSH_PLUGIN_README}
+    for name, content in templates.items():
+        target = plugin_dir / name
+        if not target.exists():
+            target.write_text(content, "utf-8")
+    return plugin_dir
 
 
 def merge_hooks(settings_path: Path, block: dict, logger=print) -> Path | None:
@@ -230,23 +374,239 @@ def merge_hooks(settings_path: Path, block: dict, logger=print) -> Path | None:
     return settings_path
 
 
+# ---------------- 手机桥接（HarmonyOS App） ----------------
+
+def phone_bridge_paths(cfg: dict) -> tuple[Path, Path, Path]:
+    d = Path(str(cfg.get("phone_bridge_dir") or APP_DIR / "tools" / "pc-bridge"))
+    return d, d / "bridge.py", d / "bridge_config.json"
+
+
+def lan_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("223.5.5.5", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _tcp_open(port: int) -> bool:
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        s.connect(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def write_bridge_config(cfg: dict) -> dict:
+    """把中间件配置写成 tools/pc-bridge/bridge_config.json（固定密钥/端口/状态源）。"""
+    _, _, path = phone_bridge_paths(cfg)
+    data = {
+        "listen_host": "0.0.0.0",
+        "listen_port": int(cfg.get("phone_bridge_port", 8770)),
+        "discovery_port": int(cfg.get("phone_bridge_discovery_port", 4211)),
+        "pc_name": "",
+        "service_url": f"http://127.0.0.1:{int(cfg.get('listen_port', 8765))}/health",
+        "poll_ms": 500,
+        "pair_required": bool(cfg.get("phone_bridge_pair_required", True)),
+        "pin": str(cfg.get("phone_bridge_pin") or ""),
+        "heartbeat_ms": 5000,
+        "enable_input": bool(cfg.get("phone_bridge_enable_input", False)),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    return data
+
+
+def _netsh(args: list[str]) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(["netsh"] + args, capture_output=True, text=True, timeout=8)
+        return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+    except Exception as exc:
+        return False, str(exc)
+
+
+def ensure_firewall_rules(cfg: dict) -> dict:
+    """放行 TCP 服务端口与 UDP 发现端口；需要管理员，失败不阻断启动。"""
+    if sys.platform != "win32":
+        return {"ok": False, "reason": "not_windows"}
+    tcp = int(cfg.get("phone_bridge_port", 8770))
+    udp = int(cfg.get("phone_bridge_discovery_port", 4211))
+    result = {}
+    for name, proto, port in (("AIStatusPhoneBridge-TCP", "TCP", tcp),
+                              ("AIStatusPhoneBridge-UDP", "UDP", udp)):
+        exists, _ = _netsh(["advfirewall", "firewall", "show", "rule", f"name={name}"])
+        if exists:
+            result[name] = "exists"
+            continue
+        ok, _ = _netsh(["advfirewall", "firewall", "add", "rule", f"name={name}",
+                        "dir=in", "action=allow", f"protocol={proto}",
+                        f"localport={port}"])
+        result[name] = "added" if ok else "need_admin"
+    return result
+
+
+class PhoneBridgeManager:
+    """把 tools/pc-bridge/bridge.py 作为子进程随中间件一起启停。"""
+
+    def __init__(self, cfg: dict, log: logging.Logger):
+        self.cfg, self.log = cfg, log
+        self.proc: subprocess.Popen | None = None
+        self.stop_evt = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def _spawn(self):
+        d, script, _ = phone_bridge_paths(self.cfg)
+        if not script.exists():
+            return None
+        kwargs: dict = {"cwd": str(d), "stdout": subprocess.DEVNULL,
+                        "stderr": subprocess.DEVNULL}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.Popen([sys.executable, str(script)], **kwargs)
+
+    def start(self) -> None:
+        if not self.cfg.get("phone_bridge_enabled", True):
+            self.log.info("手机桥接已关闭（phone_bridge_enabled=false）")
+            return
+        _, script, _ = phone_bridge_paths(self.cfg)
+        if not script.exists():
+            self.log.warning("手机桥接未启用：缺少 %s", script)
+            return
+        bcfg = write_bridge_config(self.cfg)
+        if self.cfg.get("phone_bridge_firewall", True):
+            self.log.info("手机桥接防火墙规则：%s", ensure_firewall_rules(self.cfg))
+        if _tcp_open(int(bcfg["listen_port"])):
+            self.log.warning("端口 %s 已被其它桥接服务占用，集成版未启动；"
+                             "请关闭旧的 start_bridge.bat / bridge.py 后重启本服务",
+                             bcfg["listen_port"])
+            return
+        self.proc = self._spawn()
+        if self.proc is None:
+            return
+        self.log.info("手机桥接已启动：http://%s:%s  UDP 发现 :%s  PIN=%s",
+                      lan_ip(), bcfg["listen_port"], bcfg["discovery_port"],
+                      bcfg["pin"] or "(随机)")
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+        self.thread.start()
+
+    def _watch(self) -> None:
+        while not self.stop_evt.wait(5):
+            if self.proc is not None and self.proc.poll() is not None:
+                # 端口已被别的服务占用时不要再拉一个，避免双实例抢连接
+                if _tcp_open(int(self.cfg.get("phone_bridge_port", 8770))):
+                    continue
+                self.log.warning("手机桥接子进程退出，自动重启")
+                self.proc = self._spawn()
+
+    def stop(self) -> None:
+        self.stop_evt.set()
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                self.proc.kill()
+            self.log.info("手机桥接已停止")
+
+
 # ---------------- 子命令 ----------------
 
 def cmd_start(args) -> int:
     cfg = load_config(args)
     log = setup_logging(cfg, args.verbose)
+    bridge = PhoneBridgeManager(cfg, log)
+    bridge.start()
     svc = StatusService(cfg, log)
     print("=" * 66)
     print(f" AI 工作状态灯中间件 v{__version__}  协议 {P.PROTO}")
     print(f" 事件总线  http://{cfg['listen_host']}:{cfg['listen_port']}/event")
     print(f" 设备策略  {'模拟模式' if cfg['simulate'] else '串口优先 -> 局域网回落'}")
-    print(" 停止服务  Ctrl+C（会释放 LED 并回 idle）")
+    if cfg.get("phone_bridge_enabled", True):
+        print(f" 手机桥接  http://{lan_ip()}:{cfg.get('phone_bridge_port', 8770)}"
+              f"   UDP 发现 :{cfg.get('phone_bridge_discovery_port', 4211)}"
+              f"   PIN {cfg.get('phone_bridge_pin') or '(随机)'}")
+    print(" 停止服务  Ctrl+C（会释放 LED 并停止手机桥接）")
     print("=" * 66)
     try:
         svc.run()
     except KeyboardInterrupt:
         log.info("收到中断，正在释放设备 LED…")
         svc.shutdown()
+    finally:
+        bridge.stop()
+    return 0
+
+
+def cmd_phone_bridge(args) -> int:
+    """手机桥接运维：status / firewall / pin <6位>。"""
+    cfg = load_config(args)
+    action = str(args.action or "status")
+
+    if action == "firewall":
+        result = ensure_firewall_rules(cfg)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if any(v == "need_admin" for v in result.values()):
+            print("部分规则未能添加，请用管理员身份重跑："
+                  "python main.py phone-bridge firewall", file=sys.stderr)
+            return 1
+        return 0
+
+    if action == "pin":
+        pin = str(args.value or "").strip()
+        if not (pin.isdigit() and len(pin) == 6):
+            print("配对码必须是 6 位数字，例如：python main.py phone-bridge pin 123456",
+                  file=sys.stderr)
+            return 2
+        cfg_path = (Path(args.config) if getattr(args, "config", None)
+                    else APP_DIR / "config.json")
+        data = {}
+        if cfg_path.exists():
+            try:
+                data = json.loads(cfg_path.read_text("utf-8"))
+            except Exception:
+                data = {}
+        data["phone_bridge_pin"] = pin
+        cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        cfg["phone_bridge_pin"] = pin
+        write_bridge_config(cfg)
+        print(f"配对码已设为 {pin}（{cfg_path}）")
+        print("重启服务后生效：python main.py start")
+        return 0
+
+    d, script, cpath = phone_bridge_paths(cfg)
+    port = int(cfg.get("phone_bridge_port", 8770))
+    if script.exists():
+        write_bridge_config(cfg)
+    pin_file = d / "pin.txt"
+    pin_in_use = ""
+    if pin_file.exists():
+        try:
+            pin_in_use = pin_file.read_text("utf-8").strip()
+        except OSError:
+            pass
+    print(json.dumps({
+        "enabled": bool(cfg.get("phone_bridge_enabled", True)),
+        "bridge_dir": str(d),
+        "script_exists": script.exists(),
+        "config_file": str(cpath),
+        "lan_ip": lan_ip(),
+        "phone_url": f"http://{lan_ip()}:{port}",
+        "http_port": port,
+        "discovery_udp_port": int(cfg.get("phone_bridge_discovery_port", 4211)),
+        "pin": str(cfg.get("phone_bridge_pin") or ""),
+        "pin_file": str(pin_file),
+        "pin_in_use": pin_in_use,
+        "pair_required": bool(cfg.get("phone_bridge_pair_required", True)),
+        "http_listening": _tcp_open(port),
+        "firewall": "run: python main.py phone-bridge firewall",
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -263,6 +623,8 @@ def cmd_hook(args) -> int:
         payload = {}
     if args.event:
         payload.setdefault("hook_event_name", args.event)
+    if getattr(args, "profile", ""):
+        payload.setdefault("_profile", args.profile)
     try:
         _post(f"http://127.0.0.1:{args.port}/event", payload, timeout=0.4)
     except Exception:
@@ -347,27 +709,49 @@ def cmd_hooks_config(args) -> int:
 def cmd_install_hooks(args) -> int:
     cfg = load_config(args)
     paths = generate_hook_files(cfg)
-    print(f"已生成 IDE 配置片段：{paths['ide']}")
-    print(f"已生成 CLI 增量片段：{paths['cli']}")
+    harness = str(getattr(args, "harness", "codebuddy") or "codebuddy").lower()
+    print(f"已生成 IDE 片段    ：{paths['ide']}")
+    print(f"已生成 CLI 片段    ：{paths['cli']}")
+    print(f"已生成 Codex 片段  ：{paths['codex']}")
     if not args.write:
-        print("\n（预演模式）确认无误后加 --write 写入 settings.json")
-        print("  python main.py install-hooks --write --scope user")
+        print("\n（预演模式）确认无误后加 --write 写入：")
+        print("  python main.py install-hooks --write --harness codebuddy")
+        print("  python main.py install-hooks --write --harness codex")
+        print("  python main.py install-hooks --write --harness dsh")
+        print("  python main.py install-hooks --write --harness all")
         return 0
-    root = Path(args.project_root) if args.project_root else Path.cwd()
-    settings_path = (Path.home() / ".codebuddy" / "settings.json"
-                     if args.scope == "user"
-                     else root / ".codebuddy" / "settings.json")
-    try:
-        ide = json.loads(paths["ide"].read_text("utf-8"))
-        if args.with_cli:
-            ide["hooks"].update(json.loads(paths["cli"].read_text("utf-8"))["hooks"])
-        written = merge_hooks(settings_path, ide)
-        print(f"已写入：{written}")
-        print("请重启 CodeBuddy 会话使 Hooks 生效（CLI 用户还需在 /hooks 面板审核）。")
-    except Exception as exc:
-        print(f"写入失败：{exc}", file=sys.stderr)
-        return 1
-    return 0
+    targets = ["codebuddy", "codex", "dsh"] if harness == "all" else [harness]
+    ok = 0
+    for target in targets:
+        try:
+            if target == "codebuddy":
+                root = Path(args.project_root) if args.project_root else Path.cwd()
+                settings_path = (Path.home() / ".codebuddy" / "settings.json"
+                                 if args.scope == "user"
+                                 else root / ".codebuddy" / "settings.json")
+                ide = json.loads(paths["ide"].read_text("utf-8"))
+                if args.with_cli:
+                    ide["hooks"].update(json.loads(paths["cli"].read_text("utf-8"))["hooks"])
+                written = merge_hooks(settings_path, ide)
+                print(f"[codebuddy] 已写入：{written}")
+                print("  请重启 CodeBuddy 会话使 Hooks 生效（CLI 还需在 /hooks 面板审核）。")
+            elif target == "codex":
+                codex_path = Path.home() / ".codex" / "hooks.json"
+                block = json.loads(paths["codex"].read_text("utf-8"))
+                written = merge_hooks(codex_path, block)
+                print(f"[codex] 已写入：{written}")
+                print("  请重启 Codex 会话使 hooks 生效。")
+            elif target == "dsh":
+                plugin_dir = generate_dsh_plugin()
+                print(f"[dsh] 已生成插件：{plugin_dir}")
+                print(f"  安装：dsh plugin add \"{plugin_dir}\"")
+            else:
+                print(f"未知 harness：{target}", file=sys.stderr)
+                continue
+            ok += 1
+        except Exception as exc:
+            print(f"[{target}] 失败：{exc}", file=sys.stderr)
+    return 0 if ok == len(targets) else 1
 
 
 def cmd_demo(args) -> int:
@@ -621,6 +1005,58 @@ def cmd_selftest(args) -> int:
         one.update(map_hook(payload))
         check(one.current == expected, f"{payload['hook_event_name']} -> {expected}")
 
+    # 6b) 多 harness profile：Codex / DSH 的专属事件与工具名
+    check({"codebuddy", "codex", "dsh"} <= set(list_profiles()), "三套 profile 可加载")
+    for payload, expected, label in [
+        ({"_profile": "codex", "hook_event_name": "PreToolUse",
+          "tool_name": "apply_patch"}, "coding", "Codex apply_patch -> coding"),
+        ({"_profile": "codex", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "grep -rn x ."}}, "searching", "Codex Bash 检索 -> searching"),
+        ({"_profile": "codex", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+          "tool_input": {"command": "npm test"}}, "coding", "Codex Bash 执行 -> coding"),
+        ({"_profile": "codex", "hook_event_name": "PermissionRequest"}, "need_confirm",
+         "Codex PermissionRequest -> need_confirm"),
+        ({"_profile": "codex", "hook_event_name": "PreModelRequest"}, "thinking",
+         "Codex PreModelRequest -> thinking"),
+        ({"_profile": "codex", "hook_event_name": "PostModelRequest", "status": "failed"}, "error",
+         "Codex failed model request -> error"),
+        ({"_profile": "codex", "hook_event_name": "Interrupt"}, "idle",
+         "Codex Interrupt -> idle"),
+        ({"_profile": "dsh", "hook_event_name": "approval/request"}, "need_confirm",
+         "DSH approval/request -> need_confirm"),
+        ({"_profile": "dsh", "hook_event_name": "tools/pre-execute", "tool_name": "bash",
+          "tool_input": {"command": "ls -la"}}, "searching", "DSH bash ls -> searching"),
+        ({"_profile": "dsh", "hook_event_name": "turn/end"}, "done",
+         "DSH turn/end -> done"),
+    ]:
+        check(map_hook(payload).state == expected, label)
+
+    codex_hooks = _hooks_block(CODEX_EVENTS, 8765, "codex", background=True)["hooks"]
+    check({"PreModelRequest", "PostModelRequest", "Interrupt", "SessionEnd"} <= set(codex_hooks),
+          "Codex Desktop 工作态事件已注册")
+    check(all(groups[0]["hooks"][0].get("async") is True for groups in codex_hooks.values()),
+          "Codex 状态钩子后台运行，不阻塞 agent")
+
+    # 6c) DSH 状态闭环：工具完成保持工作态、输出、审批放行、完成/关闭
+    dsh_m = new_machine()
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "tools/pre-execute",
+                           "tool_name": "write_file"}))
+    check(dsh_m.current == "coding", "DSH 写代码 -> coding")
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "tools/post-execute",
+                           "tool_name": "write_file"}))
+    check(dsh_m.current == "coding", "DSH 工具完成保持 coding（不冲回 thinking）")
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "assistant/message"}))
+    check(dsh_m.current == "outputting", "DSH assistant/message -> outputting")
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "approval/request"}))
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "approval/decided",
+                           "approval_result": "allowed-once"}))
+    check(dsh_m.current == "thinking" and dsh_m.sticky is None,
+          "DSH 审批放行立即解除橙闪")
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "turn/end"}))
+    check(dsh_m.current == "done", "DSH turn/end -> done")
+    dsh_m.update(map_hook({"_profile": "dsh", "hook_event_name": "session/close"}))
+    check(dsh_m.current == "idle", "DSH session/close -> idle")
+
     # 7) clear 强制解除
     locked = new_machine()
     locked.update(map_hook({"hook_event_name": "PermissionRequest"}))
@@ -742,9 +1178,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--simulate", action="store_true", help="不访问真实设备，只打印状态帧")
     start.add_argument("--verbose", action="store_true")
 
-    hook = sub.add_parser("hook", help="供 CodeBuddy Hooks 调用（stdin JSON）")
+    hook = sub.add_parser("hook", help="供各 harness Hooks 调用（stdin JSON）")
     hook.add_argument("--port", type=int, default=8765)
     hook.add_argument("--event", default="")
+    hook.add_argument("--profile", default="",
+                      choices=["", "codebuddy", "codex", "dsh"],
+                      help="harness 映射规则；留空自动检测")
 
     probe = sub.add_parser("probe", help="探测串口 / 局域网 ESP32-S3")
     probe.add_argument("--config")
@@ -779,10 +1218,19 @@ def build_parser() -> argparse.ArgumentParser:
     hooks.add_argument("--scope", choices=["user", "project"], default="user")
     hooks.add_argument("--project-root", default="")
     hooks.add_argument("--with-cli", action="store_true", help="同时安装 CLI 增量事件")
+    hooks.add_argument("--harness", default="codebuddy",
+                       choices=["codebuddy", "codex", "dsh", "all"],
+                       help="安装到哪个 harness（默认 codebuddy）")
 
     hooks_cfg = sub.add_parser("hooks-config", help="打印推荐 Hooks 配置")
     hooks_cfg.add_argument("--config")
     hooks_cfg.add_argument("--port", type=int)
+
+    pb = sub.add_parser("phone-bridge", help="手机桥接：局域网发现 / 配对 / 端口放行")
+    pb.add_argument("action", nargs="?", default="status",
+                    choices=["status", "firewall", "pin"])
+    pb.add_argument("value", nargs="?", default="", help="pin 动作时的 6 位配对码")
+    pb.add_argument("--config")
     return parser
 
 
@@ -794,6 +1242,7 @@ def main() -> int:
         "emit": cmd_emit, "clear": cmd_clear, "demo": cmd_demo,
         "identity": cmd_identity, "selftest": cmd_selftest,
         "install-hooks": cmd_install_hooks, "hooks-config": cmd_hooks_config,
+        "phone-bridge": cmd_phone_bridge,
     }
     try:
         return handlers[args.cmd](args)

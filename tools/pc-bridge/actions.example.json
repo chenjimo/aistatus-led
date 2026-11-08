@@ -1,0 +1,11 @@
+{
+  "_note": "复制为 actions.json 后生效。键名即 action id，手机端会按 states 声明渲染按钮",
+  "focus": {
+    "cmd": "powershell -NoProfile -WindowStyle Hidden -c \"(New-Object -ComObject WScript.Shell).AppActivate('CodeBuddy')\"",
+    "timeout": 5
+  },
+  "open_log": {
+    "cmd": "powershell -NoProfile -c \"notepad $env:USERPROFILE\\.codebuddy\\logs\\latest.log\"",
+    "timeout": 5
+  }
+}

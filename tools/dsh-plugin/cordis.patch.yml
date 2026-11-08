@@ -1,0 +1,6 @@
+# Bundle patch for aistatus-led. Used when this package is listed in
+# dsh.profile.bundles; harmless otherwise.
+- id: aistatus-led
+  name: "aistatus-led-dsh"
+  config:
+    port: 8765

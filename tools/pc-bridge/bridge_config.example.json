@@ -1,0 +1,21 @@
+{
+  "_note": "复制为 bridge_config.json 后生效；不存在的键使用 bridge.py 内置默认值",
+  "listen_host": "0.0.0.0",
+  "listen_port": 8770,
+  "discovery_port": 4211,
+  "pc_name": "",
+  "service_url": "http://127.0.0.1:8765/health",
+  "poll_ms": 500,
+  "pair_required": true,
+  "heartbeat_ms": 5000,
+  "mute_default_minutes": 5,
+  "enable_input": false,
+  "input_idle_timeout_sec": 600,
+  "gesture_map": {
+    "tilt_left": ["pgup"],
+    "tilt_right": ["pgdn"],
+    "tilt_up": ["home"],
+    "tilt_down": ["end"],
+    "shake": ["esc"]
+  }
+}

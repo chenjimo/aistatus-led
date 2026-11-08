@@ -4,7 +4,40 @@
 
 ## PC 端中间件
 
-### v1.3.1（2026-11-08，当前发布版）
+### v2.0.0（2026-11-09，当前发布版）
+
+**V2 大版本：一套硬件，三套 AI 编辑器 + 手机端。**
+
+- **手机桥接一体化**：`tools/pc-bridge` 纳入本仓库，由 `start.bat → main.py start` 自动拉起、随服务停止、崩溃自拉起；UDP `4211` 局域网发现 + TCP `8770` HTTP/WS；**固定配对码 `123456`**；远控 V2 默认开启；8765/8770 均单实例保护。
+- **一键全开**：`start.bat` 自动检查并放行防火墙（缺失且非管理员时一次 UAC），随后启动中间件与手机桥接；后台自启动用 `--no-elevate` 不弹窗。
+- **三套 harness 深度校准**：Codex 原生 `PermissionRequest`；DSH 按 `app.asar` 核实的 31 个真实事件（`approval/request`、`assistant/message`、`session/event(type=turn/end)`）；工具完成后保持 `coding/searching`，`done` 10s 回 `idle`，启动期生命周期事件不再误报思考。
+- **DSH 插件按官方 schema 用 `insert` patch 安装**（`cordis.patch.yml`，相对路径），加载时上报 `aistatus/plugin-loaded` 自检。
+- **稳定性**：HTTP 断连静默、`/health` 无锁、设备发现移出全局锁、流式事件节流、两处单实例保护。
+- 自检 107 项。新增文档 `docs/06-V2功能与使用说明.md`。
+- 关联手机项目：微信小程序 <https://gitee.com/chenjimo/we-chat-mini-demo>、鸿蒙 <https://gitee.com/chenjimo/harmony-bridge>。
+
+### v1.4.0（2026-11-08）
+
+**一套灯，三套 harness 通用**：把状态映射从代码抽到 `profiles/*.json`，CodeBuddy / OpenAI Codex CLI / DeepSeek (DSH) 任意一个打开，都能驱动同一套 ESP32 灯。
+
+- **映射外置**：`profiles/codebuddy.json`、`profiles/codex.json`、`profiles/dsh.json`。`mapper.py` 只做「选 profile → 事件归一化 → 动作分发」，新增 harness 只需加一份 JSON。
+- **Codex 适配**：`install-hooks --harness codex` 写入 `~/.codex/hooks.json`（11 个事件，命令带 `--profile codex`）。Codex 原生有 `PermissionRequest`，确认框弹窗时能亮橙灯。工具名差异已处理：`apply_patch` → coding，`Bash` 里跑 grep/rg/find 等 → searching，其余命令 → coding。
+- **DSH 适配**：`install-hooks --harness dsh` 生成 `tools/dsh-plugin/`（Cordis 插件骨架），订阅 `approval/request`、`tools/pre-execute`、`tools/post-execute`、`session/*`、`turn/end` 转发到本地 `/event`（带 `_profile: dsh`）。
+- **CodeBuddy 不变**：默认 profile，命令与旧版完全一致，`install-hooks --write` 幂等、不重复注册。
+- **自启动一拖三**：`tools/codebuddy-autostart.ps1` 监听 CodeBuddy / Codex / DSH，任一进程出现就拉起服务；新增 `-Stop`（只停服务）、`-Status`（查看状态）、`-Uninstall`（移除自启动并停 watcher）、`-StopWhenAllClosed`（全部关闭时停服务）。
+- 自检扩充到 107 项（新增三套 profile 的事件/工具映射用例）。
+- **修复日志刷屏**：客户端提前断开（WinError 10053 / ConnectionAbortedError）时，`_json` 写响应与服务器 `handle_error` 都静默处理，不再打印 traceback（这类断连来自探活超时、浏览器刷新/关闭，不是服务端错误）。
+- **修复 `/health` 超时**：设备发现（串口扫描 / LAN 扫描 / mDNS，可能几十秒）移出全局锁，改到 `_tick_once` 的锁外执行，`/health` 不再被重连阻塞；主循环单次异常也不会终止服务。
+- **DSH 适配按真实事件名校正**：从 `DeepSeek Harness/resources/app.asar` 核实事件字符串，把不存在的 `turn/stop` 改为 `turn/end`、补 `approval/asked` / `approval/decided`；`approval/decided` 放行后立即解除橙闪、拒绝报 `error`。新增 `tools/dsh-plugin/install.ps1` 一键把插件装进 `~/.dsh/profiles/desktop`（备份 + 复制到 `node_modules` + 追加 `cordis.patch.yml`），插件对 Cordis waterfall 事件透传 `next()`，绝不阻断 DSH 自己的审批流程；`install-hooks` 不再覆盖已校正的插件。
+- **DSH 精准识别与状态闭环（全量校正）**：从 `app.asar` 提取全部事件名，修正 `session/end`（实际不存在，真实是 `session/close` / `session/disposed`）；补全 `turn/start`、`tool/call` / `tools/call` / `tools/execute`、`tool/result`、`agent/pre-step`、`notifications/elicitation`、`assistant/message` / `assistant/chunk` 等共 31 个真实事件。新增 `outputting`（输出）与 `post_tool_keep`（工具完成后**保持** coding/searching，不瞬间冲回 thinking）；`approval/decided` 放行立即解除橙闪，`turn/end` → done → 10s → idle，`session/close` → idle，形成完整闭环。插件加载时上报 `aistatus/plugin-loaded` 自检事件，用于区分「插件没加载」与「事件名不对」；waterfall 事件一律透传 `next()`。自检 107 项。
+- **修复 DSH 插件根本没被加载（根因：patch 语法）**：实测 DSH 重启后 `/events` 仍无任何 DSH 事件。用 DSH 自带 CLI 的 `--dump-config-schema` / `--dump-config` 取证：`cordis.patch.yml` 里的 `{id,name,config}` 是 **id-targeted override**，id 不存在会被跳过（`entry "aistatus-led" not found`）；`dsh.profile.bundles` 里的本地包名也解析不到。**新增插件必须用 `- insert: [...]`**，且 `name` 可用相对路径（以 patch 文件目录为锚点）。`install.ps1` 已改为追加 insert patch 指向 `./node_modules/aistatus-led-dsh/index.mjs`，并清理旧的 bundles 改动；用官方 `--dump-config` 验证组合树里出现 `aistatus-led` 且解析为正确的 `file:///` 路径，Node 从该 URL 加载成功并上报 `aistatus/plugin-loaded`。`desktop` profile 由 Electron 独占管理，CLI 只能用于只读诊断。
+- **修复 DSH「任务完成不变绿灯」**：从 `app.asar` 源码确认 `turn/end` **不是 Cordis 事件**——DSH 用 `session.append("turn/end", ...)` 写会话日志，并通过 `session/event` 的 `type` 字段发出；原先订阅 `ctx.on('turn/end')` 永远收不到，灯一直停在 `outputting`。插件改为订阅 `session/event` 按 `type` 重新分发 `turn/start` / `turn/end`，并订阅 `agent/turn-stopping` 兜底 `done`；流式输出事件 300ms 节流避免刷满 `/events`。`profiles/dsh.json` 补 `agent/turn-stopping → done`、`session/event → noop`。本地模拟 `assistant-stream → outputting → turn/end → done` 通过，107 项自检。
+- **修复 DSH「一启动就显示思考」**：`aistatus/plugin-loaded` 原为 `noop`（不改状态，继承上一轮的 thinking），而 `agent/created` / `session/agent-busy` 属于**启动期生命周期事件**却被映射成 `busy`（thinking）。现改为：插件加载事件 → `session_start`（idle，force 解除粘性）、`agent/created` / `session/agent-busy` → `noop`。只改 PC 侧 `profiles/dsh.json` 并重启中间件即可生效，**无需重启 DSH**。实测 `plugin-loaded→idle → agent/created→idle → user/message→thinking → tools/pre-execute→coding → turn/end→done` 全部通过。
+- **集成手机桥接（HarmonyOS App）**：把 `HarmonyOS_App/pc-bridge` 纳入 `tools/pc-bridge/`，由 `start.bat → main.py start` 自动拉起、随服务停止、崩溃自动重启，不再需要单独双击 `start_bridge.bat`。启动器生成 `bridge_config.json`（**固定配对码 `123456`**、TCP `8770`、UDP 发现 `4211`、状态源 `8765`），并自动尝试放行 Windows 防火墙入站规则（非管理员记 `need_admin`，不阻断启动）；已占用 8770 时会明确告警而不是静默跳过。新增 `main.py phone-bridge status|firewall|pin <6位>` 与管理员一键脚本 `tools/open-ports-admin.bat`；配置在 `config.json` 的 `phone_bridge_*`，`phone_bridge_enabled=false` 可关闭。实测 UDP 广播发现 → `offer(192.168.1.4:8770)`、`/v1/hello`、用 `123456` 配对成功、`/v1/snapshot` 返回 `state=searching` 全部通过。
+- **手机桥接单实例与远控开关**：实测发现 `8770` 曾被两个进程同时绑定（集成版 + 手动 `bridge.py --enable-input`），Windows `SO_REUSEADDR` 会把手机连接随机分给不同实例。给 `bridge.py` 加端口占用探测与 `allow_reuse_address=False`，`PhoneBridgeManager` 的 watchdog 重启前也检查端口；新增 `phone_bridge_enable_input`（默认 false），需要远控 V2 时在上层 `config.json` 打开即可，不必再单独跑 `start_bridge.bat`。清理后 8770 仅一个实例。
+- **`start.bat` 一键全开 + 远控默认开启**：`phone_bridge_enable_input` 默认改为 `true`（`DEFAULT_CONFIG`、`config.example.json` 同步）；`start.bat` 先检查两条防火墙规则，缺失且非管理员时自动 UAC 提权一次放行 TCP 8770 / UDP 4211，规则建好后不再弹窗，随后启动中间件（自动拉起手机桥接与远控 V2）。后台自启动 watcher 传 `--no-elevate`，避免在隐藏窗口触发 UAC。实测 `--no-elevate` 启动后 `bridge_config.enable_input=true`、`/v1/hello` 返回 `input.enabled=true`、PIN `123456`、107 项自检通过；两条防火墙规则均已存在，双击 `start.bat` 不再需要提权。
+
+### v1.3.1（2026-11-08）
 
 修复「失败报不出来」和「处理完了灯不消」两个真实问题，全部基于实测取证。
 

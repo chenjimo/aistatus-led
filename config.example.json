@@ -26,5 +26,12 @@
   "scan_workers": 32,
   "hello_timeout_ms": 350,
   "http_timeout_ms": 1500,
-  "simulate": false
+  "simulate": false,
+  "phone_bridge_enabled": true,
+  "phone_bridge_port": 8770,
+  "phone_bridge_discovery_port": 4211,
+  "phone_bridge_pin": "123456",
+  "phone_bridge_pair_required": true,
+  "phone_bridge_enable_input": true,
+  "phone_bridge_firewall": true
 }

@@ -26,9 +26,20 @@
 
 **灯效可以自己改**：设备网页「AI 状态灯」卡片里的「灯效配置」默认折叠，展开后每个状态都能单独改主色 / 辅色 / 效果 / 亮度 / 周期，保存写入 NVS，重启保留。网页卡片标题还能拖动排序，顺序记在浏览器本地。整体原则是**工作态偏暗、需要你处理时明显更亮**。
 
-**v1.3.1 起状态只认真实事件，不做静默猜测**：深度思考（长时间无事件）稳定显示紫色呼吸，不会再被误判成「需要人处理」。工具真实失败（IDE 返回 `Error calling tool: ...`）会立即红闪，约 3s 自动消退；等待态在你放行 / 本轮结束后立即解除，不会一直亮着。代价是 IDE 版实测对 `execute_command` 根本不发 Hooks、确认框也拿不到事件，这两个灯在 IDE 下基本不会自动亮——宁可不亮，也不乱亮，详见 `docs/02` 第七节。
+**v2.0.0 起一套灯支持三套 AI 编辑器 + 手机端**：CodeBuddy / OpenAI Codex CLI / DeepSeek (DSH) 任意一个打开都能驱动同一套灯，映射规则外置在 `profiles/`；手机可在同一局域网搜索并查看状态。状态只认真实事件、不做静默猜测：深度思考稳定紫色呼吸；工具真实失败会立即红闪并在 3s 后自动消退；等待态在你放行 / 本轮结束后立即解除。注意 CodeBuddy 实测对 `execute_command` 不发 Hooks、确认框也拿不到事件，它的 `need_input` / `need_confirm` 基本不会自动亮；Codex 原生有 `PermissionRequest`、DSH 有 `approval/request`，这两个平台确认框能正常亮橙灯。详见 `docs/02` 第七节。
+
+**一键全开（`start.bat`）**：双击 `start.bat` 会依次——放行 TCP `8770` / UDP `4211`（**首次可能需要一次管理员授权**，规则建好后不再弹）、启动中间件、自动拉起 `tools/pc-bridge` 手机桥接与**远控 V2（默认开启）**。手机在同一局域网发 UDP 广播（`4211`）即可搜到这台电脑，访问 `http://<本机局域网IP>:8770`，用默认配对码 **`123456`** 配对；两端都打开远控开关才会注入键鼠。
+
+端口、密钥、开关都在 `config.json` 的 `phone_bridge_*` 项；`python main.py phone-bridge status` 查看地址与实际生效配对码，`python main.py phone-bridge pin 888888` 改密钥，`python main.py phone-bridge firewall` 手动放行端口。后台自启动走 `--no-elevate`，不会在隐藏窗口弹 UAC。详见 `tools/pc-bridge/README.md`。
 
 等待态仍是**最高优先级**：一旦亮起，`coding`、`done`、工具报错等任何状态都盖不掉，只有你回复、点了确认（工具继续执行）、会话结束或 `python main.py clear` 才会解除。其余粘性状态不会被超时冲掉；PC 停止心跳 15 秒后设备自动转 `offline`（极暗蓝）。
+
+**手机端开源项目（桥接后可直接连接）**：
+
+- 微信小程序：<https://gitee.com/chenjimo/we-chat-mini-demo>
+- 鸿蒙 App（harmony-bridge）：<https://gitee.com/chenjimo/harmony-bridge>
+
+两者都通过局域网 UDP `4211` 搜索电脑、用配对码 `123456` 连接 `8770`，协议为 `ai-status-phone/1`。详细说明见 `docs/06-V2功能与使用说明.md`。
 
 ---
 
@@ -36,7 +47,7 @@
 
 | 组件 | 版本 | 位置 |
 | --- | --- | --- |
-| **PC 端中间件** | **v1.3.1** | `main.py` + `ai_status/` |
+| **PC 端中间件** | **v2.0.0** | `main.py` + `ai_status/` + `profiles/` + `tools/` |
 | **ESP32-S3 固件** | **v1.5.0（灯效可配置版）** | `esp32/firmware/ESP-S3-Demo1.ino`（仓库副本待同步） |
 | 通信协议 | `ai-status/1` v1.0.0（+ 可选 `src`） | `docs/04-协议与来源ID绑定.md` |
 | Python | 3.10+（实测 3.10.6） | 需加入 PATH |
@@ -59,21 +70,27 @@ aistatus-led/
 │   ├── 02-PC端功能与配置.md     ← 全部命令、配置项、状态机行为
 │   ├── 03-ESP32端固件与接口.md  ← 编译烧录、接口总表、绑定白名单
 │   ├── 04-协议与来源ID绑定.md   ← 状态枚举、帧格式、src 约定
-│   └── 05-版本矩阵与兼容性.md   ← 版本对应与升级注意
+│   ├── 05-版本矩阵与兼容性.md   ← 版本对应与升级注意
+│   └── 06-V2功能与使用说明.md   ★ V2：多 AI 编辑器 + 手机桥接
 ├── main.py                      ← PC 端入口（Hooks 命令指向它，别随意挪位置）
 ├── ai_status/                   ← PC 端源码（协议/映射/状态机/串口/服务）
+├── profiles/                    ← 三套 harness 映射（codebuddy / codex / dsh）
 ├── config.example.json          ← 配置样例，复制成 config.json 后修改
 ├── requirements.txt             ← 可选依赖（pyserial），不装也能跑
-├── start.bat                    ← Windows 一键启动
+├── start.bat                    ← 一键启动（自动放行端口 + 拉起手机桥接）
 ├── tools/
-│   └── codebuddy-autostart.ps1  ← 打开 CodeBuddy 自动启动服务（含安装/卸载）
+│   ├── codebuddy-autostart.ps1  ← CodeBuddy/Codex/DSH 自动启动服务
+│   ├── open-ports-admin.bat     ← 管理员一键放行 TCP 8770 / UDP 4211
+│   ├── dsh-plugin/              ← DeepSeek 插件（insert patch 安装）
+│   └── pc-bridge/               ← 手机桥接（UDP 4211 发现 + HTTP/WS 8770）
 ├── esp32/
 │   ├── README.md                ← 设备端说明入口
 │   └── firmware/
 │       └── ESP-S3-Demo1.ino     ← v1.5.0 固件源码（WiFi 已脱敏为占位符）
 └── packages/
-    ├── aistatus-led-pc-v1.3.1.zip      ← PC 端当前发布包
-    ├── aistatus-led-pc-v1.3.0.zip      ← 历史包（失败识别缺失，建议升级）
+    ├── aistatus-led-pc-v2.0.0.zip      ← PC 端当前发布包（V2：多编辑器 + 手机桥接）
+    ├── aistatus-led-pc-v1.4.0.zip      ← 历史包（三 harness，无手机桥接）
+    ├── aistatus-led-pc-v1.3.0.zip      ← 历史包（失败识别缺失）
     ├── aistatus-led-pc-v1.2.0.zip      ← 历史包（静默推断版，误报多，勿用）
     ├── aistatus-led-pc-v1.1.0.zip      ← 历史包
     └── aistatus-led-esp32-v1.5.0.zip   ← 设备端独立发布包
@@ -99,7 +116,8 @@ python main.py identity
 # 4. 安装 Hooks（自动写入本机的 Python 路径和项目路径，会备份原配置）
 python main.py install-hooks --write --scope user
 
-# 5. 重启或新建一个 CodeBuddy 会话（CLI 用户还需在 /hooks 面板审核）
+# 5. 重启或新建一个 CodeBuddy 会话（Codex Desktop 用户执行：
+#    python main.py install-hooks --write --harness codex，并在 Hooks 设置中信任）
 
 # 6. 启动常驻服务
 start.bat
@@ -116,7 +134,7 @@ python main.py clear          # 看完后解除
 
 服务窗口不要关；关掉后设备 15 秒无心跳会自动转 `offline`。
 
-> **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（88 项，不需要硬件）确认升级无误。**v1.2.0 用户请务必升级**：该版会把深度思考误报成等待态。
+> **从旧版本升级**：务必关掉旧窗口、重新运行 `start.bat`，旧进程不会自动加载新代码。可先跑 `python main.py selftest`（107 项，不需要硬件）确认升级无误。**v1.2.0 用户请务必升级**：该版会把深度思考误报成等待态。
 
 > **不想每次手动开服务**：跑一次 `powershell -ExecutionPolicy Bypass -File .\tools\codebuddy-autostart.ps1 -Install`，之后每次登录并打开 CodeBuddy 会自动拉起服务（免管理员、幂等、可卸载）。详见 `docs/01` 第 10 节。
 
@@ -158,6 +176,7 @@ python main.py clear          # 看完后解除
 - 串口直连实现是 **Windows 专用**（Win32 API + PowerShell 枚举串口）；Mac/Linux 需安装 `pyserial` 并小改串口枚举，纯局域网模式可设 `prefer_serial: false`。
 - 广播、mDNS、`/24` 扫描都**过不了路由器**：PC 与设备必须在同一网段；跨网段时只剩 USB 串口直连可用。
 - `outputting` 没有对应的 Hook 事件，默认**不做**推断（`infer_outputting: false`）；需要时在 Hook 载荷里带 `ai_status_state: "outputting"` 显式上报。
+- **Codex Desktop / CLI**：`install-hooks --write --harness codex` 会注册提示提交、模型请求、工具调用、授权、打断、完成和会话结束事件；均使用后台 Hook，因此状态推送不会阻塞 agent。首次安装后需要在 Codex 的 Hooks 设置中审核并信任。
 - **IDE 版确认框 / 提问框不发任何 Hooks 事件**（实测 `execute_command` 连 `PreToolUse` 都不发），`tool_name` 经常为空，`PostToolUse` 也经常缺失。所以 PC 端**不猜测**「等人」：`need_input` / `need_confirm` 只由明确信号触发，在 IDE 下基本不会自动亮。真正的失败由 `Error calling tool:` 精确识别，红闪 3s 自动消退；`stalled_after_ms` 默认关闭（时间猜卡住必然误报），需要兜底可设 `300000`。
 - `Notification` / `PermissionRequest` / `PermissionDenied` / `PostToolUseFailure` / `Elicitation` 等补强事件已默认注册：IDE 不发时无副作用，一旦发出即精确命中；CLI 用户仍可用 `--with-cli` 补齐其余事件。
 - 灯效的颜色与动效（如「黄色呼吸」「绿色慢闪」）由固件 `STATUS_DEFS` 决定，只改 PC 端改不了；PC 端能改的是状态判定与 `ttl` 时长。

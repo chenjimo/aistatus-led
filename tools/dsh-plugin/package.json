@@ -1,0 +1,18 @@
+{
+  "name": "aistatus-led-dsh",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "description": "Forward DeepSeek Harness events to the AI status LED middleware"
+}

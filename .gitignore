@@ -23,3 +23,10 @@ settings.json.bak-*
 # 系统
 Thumbs.db
 .DS_Store
+
+# Phone bridge runtime (contains pairing tokens / PIN, never commit)
+tools/pc-bridge/bridge_config.json
+tools/pc-bridge/pin.txt
+tools/pc-bridge/phones.json
+tools/pc-bridge/actions.json
+hooks.codex.json
