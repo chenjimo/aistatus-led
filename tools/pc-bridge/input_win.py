@@ -274,7 +274,9 @@ class InputEngine:
         }
 
     def auto_expire(self) -> bool:
-        if self.enabled and time.time() - self.last_used > self.timeout:
+        # timeout <= 0 表示永不过期：在 bridge_config.json 里设 "input_idle_timeout_sec": 0
+        # 即可让远控长期保持开启，无需每次闲置后重新启用。
+        if self.enabled and self.timeout > 0 and time.time() - self.last_used > self.timeout:
             self.enabled = False
             self.last_error = "空闲超时，远控已自动关闭"
         return self.enabled

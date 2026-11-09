@@ -33,5 +33,6 @@
   "phone_bridge_pin": "123456",
   "phone_bridge_pair_required": true,
   "phone_bridge_enable_input": true,
+  "input_idle_timeout_sec": 600,
   "phone_bridge_firewall": true
 }

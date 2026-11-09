@@ -420,6 +420,7 @@ def write_bridge_config(cfg: dict) -> dict:
         "pin": str(cfg.get("phone_bridge_pin") or ""),
         "heartbeat_ms": 5000,
         "enable_input": bool(cfg.get("phone_bridge_enable_input", False)),
+        "input_idle_timeout_sec": int(cfg.get("input_idle_timeout_sec", 600)),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
