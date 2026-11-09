@@ -65,9 +65,9 @@ DEFAULT_CONFIG = {
     "pin": "",                      # 固定配对码；留空则每次启动随机生成
     "heartbeat_ms": 5000,
     "mute_default_minutes": 5,
-    # V2：远控默认关闭，必须显式在电脑端打开
-    "enable_input": False,
-    "input_idle_timeout_sec": 600,
+    # V2：远控默认开启（私域工具便捷优先；如需收紧安全见 docs/06「安全加固」按需配置）
+    "enable_input": True,
+    "input_idle_timeout_sec": 0,
     "gesture_map": {},
 }
 

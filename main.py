@@ -419,8 +419,8 @@ def write_bridge_config(cfg: dict) -> dict:
         "pair_required": bool(cfg.get("phone_bridge_pair_required", True)),
         "pin": str(cfg.get("phone_bridge_pin") or ""),
         "heartbeat_ms": 5000,
-        "enable_input": bool(cfg.get("phone_bridge_enable_input", False)),
-        "input_idle_timeout_sec": int(cfg.get("input_idle_timeout_sec", 600)),
+        "enable_input": bool(cfg.get("phone_bridge_enable_input", True)),
+        "input_idle_timeout_sec": int(cfg.get("input_idle_timeout_sec", 0)),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
